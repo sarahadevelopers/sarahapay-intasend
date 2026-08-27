@@ -1,4 +1,14 @@
-// Helper: display status message
+// =============================================
+// INTASEND PAYMENT SCRIPT
+// =============================================
+
+// ─── Constants ──────────────────────────────────
+// Update these to match your new backend
+const API_BASE = 'https://your-render-url.onrender.com'; // ← UPDATE THIS
+const API_SECRET = process.env.INTASEND_SECRET_KEY || 'your_intasend_secret_key'; // ← UPDATE
+const RECAPTCHA_SITE_KEY = '6LcKDGEtAAAAAJKAWjXB7j5bSIPvzz94wBWapTD5';
+
+// ─── Helper Functions ──────────────────────────
 function showStatus(message, type) {
     const status = document.getElementById("status");
     if (!status) return;
@@ -6,7 +16,6 @@ function showStatus(message, type) {
     status.innerText = message;
 }
 
-// Helper: enable/disable pay button
 function setPayButton(disabled, text = null) {
     const btn = document.getElementById("payBtn");
     if (!btn) return;
@@ -14,168 +23,124 @@ function setPayButton(disabled, text = null) {
     if (text !== null) btn.innerText = text;
 }
 
-// ---------- Shared secret (must match API_SECRET in Render) ----------
-const API_SECRET = "103e07b75c0b3d874cd4376dd0e095729f66d4f26803361aa087df169acc4ac4";
-
-// ---------- reCAPTCHA site key (from Google) ----------
-const RECAPTCHA_SITE_KEY = "6LcKDGEtAAAAAJKAWjXB7j5bSIPvzz94wBWapTD5";
-
-// Retry payment using /api/retry-payment endpoint
-async function retryPayment(phone) {
-    const retryBtn = document.getElementById("retryBtn");
-    if (retryBtn) {
-        retryBtn.disabled = true;
-        retryBtn.innerText = "Retrying...";
-    }
-    showStatus("Retrying payment...", "blue");
-
-    try {
-        const API_RETRY_URL = "https://sarahapay.onrender.com/api/retry-payment";
-        const response = await fetch(API_RETRY_URL, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "X-API-Secret": API_SECRET
-            },
-            body: JSON.stringify({ phone: phone })
-        });
-        const data = await response.json();
-
-        if (response.ok) {
-            showStatus(data.message || "Retry initiated. Check your phone for M-PESA prompt.", "success");
-            const rb = document.getElementById("retryBtn");
-            if (rb) rb.remove();
-            setPayButton(false, "Pay Now");
-        } else if (response.status === 429) {
-            const errorMsg = data.error || "Too many failed attempts. Please wait.";
-            showStatus(errorMsg, "error");
-            const match = errorMsg.match(/(\d+)\s*second/);
-            const waitSeconds = match ? parseInt(match[1]) : 30;
-            startCooldownTimer(waitSeconds, phone);
-        } else {
-            showStatus(data.error || "Retry failed. Try again later.", "error");
-            if (retryBtn) {
-                retryBtn.disabled = false;
-                retryBtn.innerText = "Retry Payment";
-            }
-        }
-    } catch (err) {
-        console.error("Retry error:", err);
-        showStatus("Network error. Please refresh and try again.", "error");
-        if (retryBtn) {
-            retryBtn.disabled = false;
-            retryBtn.innerText = "Retry Payment";
-        }
-    }
-}
-
-// Countdown timer for cooldown period (in seconds)
-function startCooldownTimer(seconds, phone) {
+function startCooldownTimer(seconds) {
     let remaining = seconds;
     const timerInterval = setInterval(() => {
         if (remaining <= 0) {
             clearInterval(timerInterval);
-            showStatus("You can now retry again.", "blue");
-            offerRetryButton(phone);
+            showStatus("You can try again now.", "blue");
+            setPayButton(false, "Pay Now");
         } else {
-            showStatus(`Too many failed attempts. Please wait ${remaining} seconds before retrying.`, "error");
+            showStatus(`Please wait ${remaining} seconds before trying again.`, "error");
             remaining--;
         }
     }, 1000);
 }
 
-// Create or show retry button
-function offerRetryButton(phone) {
-    let retryBtn = document.getElementById("retryBtn");
-    if (!retryBtn) {
-        retryBtn = document.createElement("button");
-        retryBtn.id = "retryBtn";
-        retryBtn.innerText = "Retry Payment";
-        retryBtn.style.marginTop = "10px";
-        retryBtn.style.padding = "10px 20px";
-        retryBtn.style.backgroundColor = "#ff9800";
-        retryBtn.style.border = "none";
-        retryBtn.style.borderRadius = "5px";
-        retryBtn.style.cursor = "pointer";
-        retryBtn.onclick = () => retryPayment(phone);
-        const payBtn = document.getElementById("payBtn");
-        if (payBtn && payBtn.parentNode) {
-            payBtn.parentNode.insertBefore(retryBtn, payBtn.nextSibling);
-        } else {
-            document.getElementById("paymentForm").appendChild(retryBtn);
-        }
-    } else {
-        retryBtn.style.display = "block";
-        retryBtn.disabled = false;
-        retryBtn.innerText = "Retry Payment";
-        retryBtn.onclick = () => retryPayment(phone);
-    }
-}
-
-// Main payment function (with reCAPTCHA)
+// ─── Main Payment Function ─────────────────────
 async function handlePayment() {
-    const name = document.getElementById("name").value;
-    const phone = document.getElementById("phone").value;
-    const amount = document.getElementById("amount").value;
+    const phone = document.getElementById("phone").value.trim();
+    const plan = document.getElementById("plan").value;
+    const userId = document.getElementById("userId").value || 'demo_user';
 
-    if (!name || !phone || !amount) {
-        alert("Please fill in name, phone and amount");
+    if (!phone) {
+        alert("Please enter your phone number");
         return;
     }
 
+    // Format phone to 254XXXXXXXXX
+    let formattedPhone = phone.replace(/\s/g, '');
+    if (formattedPhone.startsWith('0')) {
+        formattedPhone = '254' + formattedPhone.slice(1);
+    } else if (!formattedPhone.startsWith('254')) {
+        formattedPhone = '254' + formattedPhone.replace(/^\+/, '');
+    }
+
     setPayButton(true, "Processing...");
-    showStatus("Requesting M-Pesa prompt...", "blue");
+    showStatus("Sending M-Pesa prompt...", "blue");
 
     try {
-        // ---------- Get reCAPTCHA token (invisible) ----------
-        let recaptchaToken = '';
-        try {
-            // Execute reCAPTCHA and get token
-            recaptchaToken = await grecaptcha.execute(RECAPTCHA_SITE_KEY, { action: 'payment' });
-        } catch (captchaErr) {
-            console.error("reCAPTCHA error:", captchaErr);
-            // If reCAPTCHA fails (e.g., script not loaded), we still proceed
-            // but the backend will reject if token is missing.
-            // Optionally, you can show a message and return.
-            // For production, you might want to block payment if CAPTCHA fails.
-        }
+        // Get reCAPTCHA token
+        const recaptchaToken = await grecaptcha.execute(RECAPTCHA_SITE_KEY, { action: 'payment' });
 
-        const API_URL = "https://sarahapay.onrender.com/api/pay";
-        const response = await fetch(API_URL, {
+        const response = await fetch(`${API_BASE}/api/pay`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
                 "X-API-Secret": API_SECRET,
-                "X-Recaptcha-Token": recaptchaToken   // <-- Add token header
+                "X-Recaptcha-Token": recaptchaToken
             },
-            body: JSON.stringify({ name, phone, amount })
+            body: JSON.stringify({ 
+                phone: formattedPhone, 
+                plan: plan, 
+                userId: userId 
+            })
         });
+
         const data = await response.json();
 
         if (response.ok) {
-            showStatus("STK Push sent. Check your phone.", "success");
+            showStatus("✅ STK Push sent! Check your phone for the M-Pesa prompt.", "success");
+            // Hide retry button if exists
             const rb = document.getElementById("retryBtn");
             if (rb) rb.remove();
+            setPayButton(false, "Pay Now");
+            
+            // Store transaction reference for status checking
+            localStorage.setItem('lastTransactionRef', data.transactionRef);
         } else {
             const errorMsg = data.error || data.details || "Payment failed";
-            showStatus(errorMsg, "error");
-
+            
             if (response.status === 409) {
                 showStatus("You already have a pending payment. Check your phone or wait a few minutes.", "error");
-                startCooldownTimer(30, phone);
+                startCooldownTimer(30);
             } else if (response.status === 429) {
-                const waitMatch = errorMsg.match(/(\d+)\s*second/);
-                const waitSeconds = waitMatch ? parseInt(waitMatch[1]) : 30;
-                startCooldownTimer(waitSeconds, phone);
+                showStatus(errorMsg, "error");
+                const match = errorMsg.match(/(\d+)\s*second/);
+                const waitSeconds = match ? parseInt(match[1]) : 30;
+                startCooldownTimer(waitSeconds);
             } else {
-                offerRetryButton(phone);
+                showStatus(errorMsg, "error");
+                setPayButton(false, "Pay Now");
             }
         }
     } catch (err) {
         console.error("Payment error:", err);
-        showStatus("Server error. Please try again.", "error");
-        offerRetryButton(phone);
-    } finally {
+        showStatus("Network error. Please refresh and try again.", "error");
         setPayButton(false, "Pay Now");
     }
 }
+
+// ─── Check Transaction Status ───────────────────
+async function checkTransactionStatus() {
+    const ref = localStorage.getItem('lastTransactionRef');
+    if (!ref) return;
+
+    try {
+        const response = await fetch(`${API_BASE}/api/transaction/${ref}`);
+        const data = await response.json();
+        
+        if (data.status === 'completed') {
+            showStatus("✅ Payment confirmed! Thank you.", "success");
+            localStorage.removeItem('lastTransactionRef');
+        } else if (data.status === 'failed') {
+            showStatus("❌ Payment failed. Please try again.", "error");
+            localStorage.removeItem('lastTransactionRef');
+            setPayButton(false, "Pay Now");
+        } else {
+            // Still pending - check again in 10 seconds
+            setTimeout(checkTransactionStatus, 10000);
+        }
+    } catch (err) {
+        console.error('Status check failed:', err);
+    }
+}
+
+// ─── Auto-check status on page load ────────────
+document.addEventListener('DOMContentLoaded', () => {
+    const ref = localStorage.getItem('lastTransactionRef');
+    if (ref) {
+        showStatus("Checking payment status...", "blue");
+        setTimeout(checkTransactionStatus, 3000);
+    }
+});
