@@ -1,5 +1,5 @@
 // =============================================
-// RENTSPACE – INTASEND PAYMENT SERVER
+// INTASEND PAYMENT ROUTER – Multi-Site Support
 // =============================================
 
 require('dotenv').config();
@@ -8,15 +8,13 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
+const axios = require('axios'); // needed for callback calls
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ─── CORS ──────────────────────────────────────────────────────
-app.use(cors({
-  origin: '*', // For testing; restrict in production
-  credentials: true
-}));
+app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 
 // ─── MongoDB Connection ──────────────────────────────────────
@@ -34,14 +32,16 @@ const intasend = new Intasend(
 
 // ─── Transaction Schema ──────────────────────────────────────
 const transactionSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  userId: String,                    // User ID on the website
   plan: { type: String, enum: ['basic', 'pro', 'developer'] },
   phone: String,
   amount: Number,
   status: { type: String, default: 'pending' },
-  checkoutId: String,        // IntaSend checkout ID
+  checkoutId: String,
   mpesaReceipt: String,
   transactionRef: String,
+  website: { type: String, default: 'rentspace' },
+  callbackUrl: { type: String, required: true },   // ⭐ The website's payment callback
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -50,9 +50,9 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 
 // ─── Subscription Plans ──────────────────────────────────────
 const PLANS = {
-  basic: { name: 'Basic', price: 2500, listings: 20 },
-  pro: { name: 'Pro', price: 5000, listings: Infinity },
-  developer: { name: 'Developer', price: 10000, listings: Infinity }
+  basic: { name: 'Basic', price: 2, listings: 20 },
+  pro: { name: 'Pro', price: 5, listings: Infinity },
+  developer: { name: 'Developer', price: 10, listings: Infinity }
 };
 
 // ─── Health Check ────────────────────────────────────────────
@@ -65,40 +65,47 @@ app.get('/api/subscriptions/plans', (req, res) => {
   res.json(PLANS);
 });
 
-// ─── Initiate STK Push ──────────────────────────────────────
+// ─── Initiate STK Push (with callbackUrl) ────────────────────
 app.post('/api/pay', async (req, res) => {
   try {
-    const { phone, plan, userId } = req.body;
+    const { phone, plan, userId, website, callbackUrl } = req.body;
+
+    // ── Validate required fields ──────────────────────────────
     if (!phone || !plan || !PLANS[plan]) {
       return res.status(400).json({ error: 'Phone number and valid plan required' });
+    }
+    if (!callbackUrl) {
+      return res.status(400).json({ error: 'callbackUrl is required' });
     }
 
     const amount = PLANS[plan].price;
     const transactionRef = `RENT-${uuidv4().slice(0, 8)}`;
 
-    // Create transaction record (pending)
+    // ── Create transaction record ─────────────────────────────
     const tx = new Transaction({
-      userId,
+      userId: userId || 'unknown',
       plan,
       phone,
       amount,
       transactionRef,
+      website: website || 'rentspace',
+      callbackUrl,
       status: 'pending'
     });
     await tx.save();
 
-    // Initiate STK push via IntaSend
+    // ── Initiate STK push via IntaSend ────────────────────────
     const response = await intasend.collections.mpesaStkPush({
       first_name: 'RentSpace',
       phone_number: phone,
-      email: 'customer@rentspace.co.ke', // optional
+      email: 'customer@rentspace.co.ke',
       amount: amount,
       currency: 'KES',
       reference: transactionRef,
       description: `RentSpace ${plan} subscription`
     });
 
-    // Store checkoutId from IntaSend
+    // ── Store checkoutId ──────────────────────────────────────
     const checkoutId = response.id || response.checkout_id;
     if (checkoutId) {
       tx.checkoutId = checkoutId;
@@ -132,7 +139,7 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
 
     const { id, state, reference, mpesa_receipt_number, status } = payload;
 
-    // Find transaction by checkoutId or transactionRef
+    // ── Find transaction ──────────────────────────────────────
     const tx = await Transaction.findOne({
       $or: [
         { checkoutId: id },
@@ -147,35 +154,32 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
 
     const isSuccess = state === 'completed' || status === 'success';
 
+    // ── Update transaction status ─────────────────────────────
     if (isSuccess) {
-      // Update transaction
       tx.status = 'completed';
       tx.mpesaReceipt = mpesa_receipt_number;
       tx.updatedAt = new Date();
       await tx.save();
 
-      // If userId exists, activate the subscription
-      if (tx.userId) {
-        const User = require('./models/User'); // adjust path if needed
-        const Property = require('./models/Property');
+      console.log(`✅ Payment confirmed for transaction ${tx.transactionRef}`);
 
-        const user = await User.findById(tx.userId);
-        if (user) {
-          user.subscriptionPlan = tx.plan;
-          user.subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-          await user.save();
-
-          // Update all existing properties with the new plan
-          await Property.updateMany(
-            { ownerId: user._id },
-            { $set: { ownerSubscriptionPlan: tx.plan } }
-          );
-
-          console.log(`✅ User ${user.email} upgraded to ${tx.plan}`);
-        }
+      // ⭐⭐⭐ CALL THE WEBSITE'S CALLBACK URL ⭐⭐⭐
+      try {
+        await axios.post(tx.callbackUrl, {
+          transactionRef: tx.transactionRef,
+          userId: tx.userId,
+          plan: tx.plan,
+          status: 'completed',
+          mpesaReceipt: tx.mpesaReceipt,
+          amount: tx.amount,
+          phone: tx.phone
+        }, { timeout: 10000 });
+        console.log(`✅ Notified ${tx.website} (${tx.callbackUrl})`);
+      } catch (callbackErr) {
+        console.error(`❌ Failed to notify ${tx.website}:`, callbackErr.message);
+        // We don't re-throw; we still respond 200 to IntaSend
       }
 
-      console.log(`✅ Payment confirmed for transaction ${tx.transactionRef}`);
     } else {
       tx.status = 'failed';
       tx.updatedAt = new Date();
@@ -183,8 +187,9 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
       console.log(`❌ Payment failed for transaction ${tx.transactionRef}`);
     }
 
-    // Always respond 200 to acknowledge receipt
+    // ── Always respond 200 to acknowledge receipt ─────────────
     res.status(200).send('OK');
+
   } catch (error) {
     console.error('❌ Webhook error:', error);
     res.status(500).json({ error: 'Webhook processing failed' });

@@ -4,7 +4,7 @@
 
 // ─── Constants ──────────────────────────────────
 // Update these to match your new backend
-const API_BASE = 'https://your-render-url.onrender.com'; // ← UPDATE THIS
+const API_BASE = 'https://sarahapay-intasend.onrender.com'; // ← UPDATE THIS
 const API_SECRET = process.env.INTASEND_SECRET_KEY || 'your_intasend_secret_key'; // ← UPDATE
 const RECAPTCHA_SITE_KEY = '6LcKDGEtAAAAAJKAWjXB7j5bSIPvzz94wBWapTD5';
 
