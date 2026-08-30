@@ -63,6 +63,14 @@ app.get('/api/health', (req, res) => {
 // ─── 👇 ADD THIS RIGHT HERE ──────────────────────────────────
 app.get('/api/db-test', async (req, res) => {
   try {
+    // Check if MongoDB is connected (readyState 1 = connected)
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({ 
+        status: 'error', 
+        message: 'MongoDB not connected yet. Current state: ' + mongoose.connection.readyState 
+      });
+    }
+    
     await mongoose.connection.db.admin().ping();
     res.json({ status: 'ok', message: 'MongoDB connected' });
   } catch (err) {
