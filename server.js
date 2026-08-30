@@ -60,6 +60,16 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'intasend-server' });
 });
 
+// ─── 👇 ADD THIS RIGHT HERE ──────────────────────────────────
+app.get('/api/db-test', async (req, res) => {
+  try {
+    await mongoose.connection.db.admin().ping();
+    res.json({ status: 'ok', message: 'MongoDB connected' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 // ─── Subscription Plans ──────────────────────────────────────
 app.get('/api/subscriptions/plans', (req, res) => {
   res.json(PLANS);
