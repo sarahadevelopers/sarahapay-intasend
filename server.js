@@ -30,11 +30,12 @@ mongoose.connect(process.env.MONGO_URI, mongoOptions)
   .catch(err => console.error('❌ MongoDB Error:', err));
 
 // ─── IntaSend SDK Setup ──────────────────────────────────────
+// ─── IntaSend SDK Setup ──────────────────────────────────────
 const Intasend = require('intasend-node');
 const intasend = new Intasend(
-  process.env.INTASEND_SECRET_KEY,
-  process.env.INTASEND_PUBLISHABLE_KEY,
-  process.env.INTASEND_ENVIRONMENT || 'sandbox'
+  process.env.INTASEND_API_KEY,         // ← Use INTASEND_API_KEY
+  process.env.INTASEND_PUBLIC_KEY,      // ← Use INTASEND_PUBLIC_KEY
+  process.env.INTASEND_ENVIRONMENT || 'production'
 );
 
 // ─── Transaction Schema ──────────────────────────────────────
