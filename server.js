@@ -7,8 +7,10 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const { MongoClient } = require('mongodb'); // for diagnostic test
+const dns = require('dns'); // for DNS test
 const { v4: uuidv4 } = require('uuid');
-const axios = require('axios'); // needed for callback calls
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -17,22 +19,28 @@ const PORT = process.env.PORT || 5000;
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 
-// ─── MongoDB Connection ──────────────────────────────────────
-mongoose.connect(process.env.MONGO_URI)
+// ─── MongoDB Connection with Timeouts ────────────────────────
+const mongoOptions = {
+  serverSelectionTimeoutMS: 10000, // 10 seconds
+  socketTimeoutMS: 45000,
+  connectTimeoutMS: 10000,
+};
+
+mongoose.connect(process.env.MONGO_URI, mongoOptions)
   .then(() => console.log('✅ MongoDB Connected'))
   .catch(err => console.error('❌ MongoDB Error:', err));
 
-// ─── IntaSend SDK Setup ──────────────────────────────────────
+// ─── IntaSend SDK Setup (Fix variable names) ────────────────
 const Intasend = require('intasend-node');
 const intasend = new Intasend(
-  process.env.INTASEND_API_KEY,
-  process.env.INTASEND_PUBLIC_KEY,
+  process.env.INTASEND_SECRET_KEY,      // was INTASEND_API_KEY
+  process.env.INTASEND_PUBLISHABLE_KEY, // was INTASEND_PUBLIC_KEY
   process.env.INTASEND_ENVIRONMENT || 'sandbox'
 );
 
 // ─── Transaction Schema ──────────────────────────────────────
 const transactionSchema = new mongoose.Schema({
-  userId: String,                    // User ID on the website
+  userId: String,
   plan: { type: String, enum: ['basic', 'pro', 'developer'] },
   phone: String,
   amount: Number,
@@ -41,7 +49,7 @@ const transactionSchema = new mongoose.Schema({
   mpesaReceipt: String,
   transactionRef: String,
   website: { type: String, default: 'rentspace' },
-  callbackUrl: { type: String, required: true },   // ⭐ The website's payment callback
+  callbackUrl: { type: String, required: true },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -55,22 +63,54 @@ const PLANS = {
   developer: { name: 'Developer', price: 10, listings: Infinity }
 };
 
-// ─── Health Check ────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════
+//  DIAGNOSTIC ENDPOINTS (to troubleshoot network/DNS issues)
+// ═════════════════════════════════════════════════════════════
+
+// 1. Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'intasend-server' });
 });
 
-// ─── 👇 ADD THIS RIGHT HERE ──────────────────────────────────
+// 2. DNS resolution test (check if Render can resolve MongoDB hostnames)
+app.get('/api/dns-test', (req, res) => {
+  const hostname = 'ac-gzcc1u0-shard-00-00.mqrczsc.mongodb.net';
+  dns.resolve(hostname, (err, addresses) => {
+    if (err) {
+      return res.status(500).json({ status: 'error', message: err.message });
+    }
+    res.json({ status: 'ok', addresses });
+  });
+});
+
+// 3. Direct MongoDB connection test (using MongoClient, bypassing Mongoose)
+app.get('/api/test-connection', async (req, res) => {
+  const uri = process.env.MONGO_URI;
+  const client = new MongoClient(uri, {
+    serverSelectionTimeoutMS: 10000,
+    connectTimeoutMS: 10000,
+  });
+
+  try {
+    await client.connect();
+    await client.db('admin').command({ ping: 1 });
+    await client.close();
+    res.json({ status: 'ok', message: 'MongoDB connection successful' });
+  } catch (err) {
+    await client.close();
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// 4. Mongoose connection state check
 app.get('/api/db-test', async (req, res) => {
   try {
-    // Check if MongoDB is connected (readyState 1 = connected)
     if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ 
-        status: 'error', 
-        message: 'MongoDB not connected yet. Current state: ' + mongoose.connection.readyState 
+      return res.status(503).json({
+        status: 'error',
+        message: 'MongoDB not connected yet. Current state: ' + mongoose.connection.readyState
       });
     }
-    
     await mongoose.connection.db.admin().ping();
     res.json({ status: 'ok', message: 'MongoDB connected' });
   } catch (err) {
@@ -88,7 +128,6 @@ app.post('/api/pay', async (req, res) => {
   try {
     const { phone, plan, userId, website, callbackUrl } = req.body;
 
-    // ── Validate required fields ──────────────────────────────
     if (!phone || !plan || !PLANS[plan]) {
       return res.status(400).json({ error: 'Phone number and valid plan required' });
     }
@@ -123,7 +162,6 @@ app.post('/api/pay', async (req, res) => {
       description: `RentSpace ${plan} subscription`
     });
 
-    // ── Store checkoutId ──────────────────────────────────────
     const checkoutId = response.id || response.checkout_id;
     if (checkoutId) {
       tx.checkoutId = checkoutId;
@@ -157,7 +195,6 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
 
     const { id, state, reference, mpesa_receipt_number, status } = payload;
 
-    // ── Find transaction ──────────────────────────────────────
     const tx = await Transaction.findOne({
       $or: [
         { checkoutId: id },
@@ -172,7 +209,6 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
 
     const isSuccess = state === 'completed' || status === 'success';
 
-    // ── Update transaction status ─────────────────────────────
     if (isSuccess) {
       tx.status = 'completed';
       tx.mpesaReceipt = mpesa_receipt_number;
@@ -205,7 +241,6 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
       console.log(`❌ Payment failed for transaction ${tx.transactionRef}`);
     }
 
-    // ── Always respond 200 to acknowledge receipt ─────────────
     res.status(200).send('OK');
 
   } catch (error) {
