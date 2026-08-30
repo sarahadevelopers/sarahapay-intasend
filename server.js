@@ -7,7 +7,6 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const { MongoClient } = require('mongodb'); // for diagnostic test
 const dns = require('dns'); // for DNS test
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
@@ -21,7 +20,7 @@ app.use(express.json());
 
 // ─── MongoDB Connection with Timeouts ────────────────────────
 const mongoOptions = {
-  serverSelectionTimeoutMS: 10000, // 10 seconds
+  serverSelectionTimeoutMS: 10000,
   socketTimeoutMS: 45000,
   connectTimeoutMS: 10000,
 };
@@ -30,11 +29,11 @@ mongoose.connect(process.env.MONGO_URI, mongoOptions)
   .then(() => console.log('✅ MongoDB Connected'))
   .catch(err => console.error('❌ MongoDB Error:', err));
 
-// ─── IntaSend SDK Setup (Fix variable names) ────────────────
+// ─── IntaSend SDK Setup ──────────────────────────────────────
 const Intasend = require('intasend-node');
 const intasend = new Intasend(
-  process.env.INTASEND_SECRET_KEY,      // was INTASEND_API_KEY
-  process.env.INTASEND_PUBLISHABLE_KEY, // was INTASEND_PUBLIC_KEY
+  process.env.INTASEND_SECRET_KEY,
+  process.env.INTASEND_PUBLISHABLE_KEY,
   process.env.INTASEND_ENVIRONMENT || 'sandbox'
 );
 
@@ -64,7 +63,7 @@ const PLANS = {
 };
 
 // ═════════════════════════════════════════════════════════════
-//  DIAGNOSTIC ENDPOINTS (to troubleshoot network/DNS issues)
+//  DIAGNOSTIC ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 
 // 1. Health check
@@ -72,7 +71,7 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'intasend-server' });
 });
 
-// 2. DNS resolution test (check if Render can resolve MongoDB hostnames)
+// 2. DNS resolution test (checks if Render can resolve MongoDB hostnames)
 app.get('/api/dns-test', (req, res) => {
   const hostname = 'ac-gzcc1u0-shard-00-00.mqrczsc.mongodb.net';
   dns.resolve(hostname, (err, addresses) => {
@@ -83,26 +82,7 @@ app.get('/api/dns-test', (req, res) => {
   });
 });
 
-// 3. Direct MongoDB connection test (using MongoClient, bypassing Mongoose)
-app.get('/api/test-connection', async (req, res) => {
-  const uri = process.env.MONGO_URI;
-  const client = new MongoClient(uri, {
-    serverSelectionTimeoutMS: 10000,
-    connectTimeoutMS: 10000,
-  });
-
-  try {
-    await client.connect();
-    await client.db('admin').command({ ping: 1 });
-    await client.close();
-    res.json({ status: 'ok', message: 'MongoDB connection successful' });
-  } catch (err) {
-    await client.close();
-    res.status(500).json({ status: 'error', message: err.message });
-  }
-});
-
-// 4. Mongoose connection state check
+// 3. Mongoose connection state check
 app.get('/api/db-test', async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) {
@@ -123,7 +103,7 @@ app.get('/api/subscriptions/plans', (req, res) => {
   res.json(PLANS);
 });
 
-// ─── Initiate STK Push (with callbackUrl) ────────────────────
+// ─── Initiate STK Push ──────────────────────────────────────
 app.post('/api/pay', async (req, res) => {
   try {
     const { phone, plan, userId, website, callbackUrl } = req.body;
@@ -231,7 +211,7 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
         console.log(`✅ Notified ${tx.website} (${tx.callbackUrl})`);
       } catch (callbackErr) {
         console.error(`❌ Failed to notify ${tx.website}:`, callbackErr.message);
-        // We don't re-throw; we still respond 200 to IntaSend
+        // Don't re-throw; respond 200 to IntaSend anyway
       }
 
     } else {
