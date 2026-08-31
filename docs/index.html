@@ -1,260 +1,111 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Quick Pay | Eclipse Ent</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quick Pay | Eclipse Ent</title>
 
-  <!-- Google Font -->
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" />
+<style>
+body{
+font-family:'Inter',sans-serif;
+display:flex;
+justify-content:center;
+align-items:center;
+height:100vh;
+background:#f1f5f9;
+margin:0;
+}
 
-  <!-- reCAPTCHA v3 -->
-  <script src="https://www.google.com/recaptcha/api.js?render=6LcKDGEtAAAAAJKAWjXB7j5bSIPvzz94wBWapTD5"></script>
+.checkout-card{
+background:white;
+padding:40px;
+border-radius:16px;
+box-shadow:0 10px 25px rgba(0,0,0,0.05);
+width:100%;
+max-width:400px;
+text-align:center;
+}
 
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
+input{
+width:100%;
+padding:12px;
+margin:10px 0;
+border:1px solid #e2e8f0;
+border-radius:8px;
+box-sizing:border-box;
+font-size:1rem;
+}
 
-    body {
-      font-family: 'Inter', sans-serif;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-      background: #f1f5f9;
-      padding: 20px;
-    }
+button{
+width:100%;
+background:#000;
+color:white;
+padding:14px;
+border:none;
+border-radius:8px;
+font-size:1rem;
+font-weight:600;
+cursor:pointer;
+margin-top:10px;
+}
 
-    .checkout-card {
-      background: white;
-      padding: 40px 32px;
-      border-radius: 20px;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.06);
-      width: 100%;
-      max-width: 440px;
-      text-align: center;
-    }
+button:disabled{
+background:#555;
+cursor:not-allowed;
+}
 
-    .checkout-card h2 {
-      margin-top: 0;
-      font-weight: 700;
-      font-size: 1.8rem;
-      color: #0f172a;
-    }
+#status{
+margin-top:20px;
+font-size:0.9rem;
+}
+</style>
 
-    .checkout-card p.subtitle {
-      color: #64748b;
-      margin-bottom: 28px;
-      font-size: 0.95rem;
-    }
+<!-- ========== reCAPTCHA v3 (invisible) ========== -->
+<!-- Your actual site key – no duplicate script tags -->
+<script src="https://www.google.com/recaptcha/api.js?render=6LcKDGEtAAAAAJKAWjXB7j5bSIPvzz94wBWapTD5"></script>
 
-    .form-group {
-      text-align: left;
-      margin-bottom: 18px;
-    }
-
-    .form-group label {
-      display: block;
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: #334155;
-      margin-bottom: 4px;
-    }
-
-    .form-group input,
-    .form-group select {
-      width: 100%;
-      padding: 12px 14px;
-      border: 1px solid #e2e8f0;
-      border-radius: 10px;
-      font-size: 1rem;
-      font-family: inherit;
-      background: #f8fafc;
-      transition: border-color 0.2s;
-    }
-
-    .form-group input:focus,
-    .form-group select:focus {
-      outline: none;
-      border-color: #2563eb;
-      background: white;
-      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
-    }
-
-    .form-group .hint {
-      font-size: 0.75rem;
-      color: #94a3b8;
-      margin-top: 4px;
-    }
-
-    .plan-prices {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin-top: 6px;
-    }
-
-    .plan-tag {
-      background: #eef2ff;
-      color: #4338ca;
-      padding: 2px 10px;
-      border-radius: 20px;
-      font-size: 0.7rem;
-      font-weight: 600;
-    }
-
-    button#payBtn {
-      width: 100%;
-      background: #0f172a;
-      color: white;
-      padding: 16px;
-      border: none;
-      border-radius: 12px;
-      font-size: 1rem;
-      font-weight: 700;
-      cursor: pointer;
-      margin-top: 10px;
-      transition: background 0.15s, opacity 0.15s;
-    }
-
-    button#payBtn:hover:not(:disabled) {
-      background: #1e293b;
-    }
-
-    button#payBtn:disabled {
-      background: #94a3b8;
-      cursor: not-allowed;
-      opacity: 0.7;
-    }
-
-    #status {
-      margin-top: 20px;
-      font-size: 0.9rem;
-      min-height: 1.4em;
-      font-weight: 500;
-    }
-
-    .divider {
-      border: none;
-      border-top: 1px solid #e2e8f0;
-      margin: 22px 0 18px;
-    }
-
-    /* responsive */
-    @media (max-width: 480px) {
-      .checkout-card {
-        padding: 28px 18px;
-      }
-    }
-  </style>
 </head>
 <body>
 
-  <div class="checkout-card">
+<div class="checkout-card">
 
-    <h2>⚡ Secure Payment</h2>
-    <p class="subtitle">Complete your purchase via M‑Pesa</p>
+<h2 style="margin-top:0;">Secure Payment</h2>
+<p style="color:#64748b;">Enter details to pay via M-Pesa</p>
 
-    <!-- Name (optional) -->
-    <div class="form-group">
-      <label for="name">Full Name (optional)</label>
-      <input type="text" id="name" placeholder="e.g. John Doe" />
-    </div>
+<input 
+type="text"
+id="name"
+placeholder="Full Name"
+required
+>
 
-    <!-- Phone -->
-    <div class="form-group">
-      <label for="phone">📱 M‑Pesa Phone Number</label>
-      <input
-        type="tel"
-        id="phone"
-        placeholder="e.g. 0712345678"
-        pattern="^(07[0-9]{8}|011[0-9]{7}|2547[0-9]{8}|25411[0-9]{7})$"
-        title="Enter a valid Safaricom number: 07XXXXXXXX, 011XXXXXXX, or 2547XXXXXXXX"
-        required
-      />
-      <div class="hint">We'll send the STK push to this number.</div>
-    </div>
+<input 
+type="tel"
+id="phone"
+placeholder="Phone (e.g. 0712345678, 0111234567, or 254111234567)"
+pattern="^(07[0-9]{8}|011[0-9]{7}|2547[0-9]{8}|25411[0-9]{7})$"
+title="Enter a valid Safaricom number: 07XXXXXXXX (10 digits), 011XXXXXXX (10 digits), 2547XXXXXXXX (12 digits), or 25411XXXXXXX (12 digits)"
+required
+>
 
-    <!-- Plan Selection -->
-    <div class="form-group">
-      <label for="plan">Choose Plan</label>
-      <select id="plan">
-        <option value="basic">Basic – KES 2</option>
-        <option value="pro" selected>Pro – KES 5</option>
-        <option value="developer">Developer – KES 10</option>
-        <option value="custom">Custom amount</option>
-      </select>
-      <div class="plan-prices">
-        <span class="plan-tag">Basic 2 KES</span>
-        <span class="plan-tag">Pro 5 KES</span>
-        <span class="plan-tag">Developer 10 KES</span>
-      </div>
-    </div>
+<input 
+type="number"
+id="amount"
+placeholder="Amount in KES"
+min="1"
+required
+>
 
-    <!-- Amount (auto-filled, but editable) -->
-    <div class="form-group">
-      <label for="amount">Amount (KES)</label>
-      <input
-        type="number"
-        id="amount"
-        placeholder="Enter amount"
-        min="1"
-        step="1"
-        required
-      />
-      <div class="hint">If you choose a plan, the amount will auto‑fill.</div>
-    </div>
+<button id="payBtn" onclick="handlePayment()">
+Pay Now
+</button>
 
-    <!-- Hidden userId (you can set this dynamically) -->
-    <input type="hidden" id="userId" value="demo_user" />
+<div id="status"></div>
 
-    <hr class="divider" />
+</div>
 
-    <button id="payBtn">💳 Pay Now</button>
-
-    <div id="status"></div>
-
-  </div>
-
-  <!-- Our main script -->
-  <script src="script.js"></script>
-
-  <!-- Auto-fill amount when plan changes -->
-  <script>
-    (function() {
-      const planSelect = document.getElementById('plan');
-      const amountInput = document.getElementById('amount');
-
-      const planPrices = {
-        basic: 2,
-        pro: 5,
-        developer: 10,
-        custom: null
-      };
-
-      function updateAmount() {
-        const selected = planSelect.value;
-        const price = planPrices[selected];
-        if (price !== null) {
-          amountInput.value = price;
-          amountInput.disabled = false; // allow manual change if they want
-        } else {
-          // custom – clear and let user type
-          amountInput.value = '';
-          amountInput.focus();
-        }
-      }
-
-      // initial fill
-      updateAmount();
-
-      // on change
-      planSelect.addEventListener('change', updateAmount);
-    })();
-  </script>
+<!-- Your main script (must be updated to send the reCAPTCHA token) -->
+<script src="script.js"></script>
 
 </body>
 </html>

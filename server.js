@@ -1,243 +1,505 @@
-// =============================================
-// INTASEND PAYMENT SERVER – Direct API Call
-// =============================================
-
 require('dotenv').config();
 
 const express = require('express');
+const axios = require('axios');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const { v4: uuidv4 } = require('uuid');
-const axios = require('axios');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 
-// ─── Middleware ──────────────────────────────
-app.use(cors({ origin: '*', credentials: true }));
-app.use(express.json());
+// =============================================
+// 1. MongoDB Connection
+// =============================================
+mongoose.connect(process.env.MONGO_URI)
+    .then(() => console.log("✅ MongoDB Connected"))
+    .catch(err => console.error("❌ MongoDB Error:", err));
 
-// ─── MongoDB Connection ──────────────────────
-const mongoOptions = {
-  serverSelectionTimeoutMS: 10000,
-  socketTimeoutMS: 45000,
-  connectTimeoutMS: 10000,
-};
-
-mongoose.connect(process.env.MONGO_URI, mongoOptions)
-  .then(() => console.log('✅ MongoDB Connected'))
-  .catch(err => console.error('❌ MongoDB Error:', err));
-
-// ─── Transaction Schema ──────────────────────
+// =============================================
+// 2. Transaction Schema
+// =============================================
 const transactionSchema = new mongoose.Schema({
-  userId: { type: String, default: 'unknown' },
-  plan: { type: String, enum: ['basic', 'pro', 'developer', 'custom'], default: 'basic' },
-  phone: String,
-  amount: Number,
-  status: { type: String, default: 'pending' },
-  checkoutId: String,
-  mpesaReceipt: String,
-  transactionRef: String,
-  website: { type: String, default: 'sarahapay' },
-  callbackUrl: { type: String, default: '' },
-  createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
+    name: String,
+    phone: String,
+    amount: String,
+    status: { type: String, default: "PENDING" },
+    checkout_id: String,          // IntaSend checkout ID
+    mpesa_receipt: String,
+    retryCount: { type: Number, default: 0 },
+    lastRetryAt: { type: Date, default: null },
+    createdAt: { type: Date, default: Date.now }
 });
 
-const Transaction = mongoose.model('Transaction', transactionSchema);
+const Transaction = mongoose.model("Transaction", transactionSchema);
 
-// ─── Subscription Plans ──────────────────────
-const PLANS = {
-  basic: { name: 'Basic', price: 2 },
-  pro: { name: 'Pro', price: 5 },
-  developer: { name: 'Developer', price: 10 },
+// =============================================
+// 3. Middleware – CORS + Body Parser
+// =============================================
+const allowedOrigins = [
+    'https://rentspace.co.ke',
+    'https://www.rentspace.co.ke',
+    'https://sarahadevelopers.github.io',
+    'http://localhost:3000',
+    'https://sarahapay-intasend.onrender.com'
+];
+
+app.use(cors({
+    origin: function (origin, callback) {
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.indexOf(origin) !== -1) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true
+}));
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+app.use(express.static("docs"));
+
+// =============================================
+// 4. Security Middleware
+// =============================================
+const VALID_SECRETS = [
+    process.env.API_SECRET,
+].filter(Boolean);
+
+const checkSecret = (req, res, next) => {
+    const secret = req.headers['x-api-secret'];
+
+    if (!secret) {
+        console.warn('❌ Missing API secret header');
+        return res.status(403).json({ error: "Missing API secret" });
+    }
+
+    if (!VALID_SECRETS.includes(secret)) {
+        console.warn(`❌ Invalid API secret: ${secret.substring(0, 10)}...`);
+        return res.status(403).json({ error: "Unauthorized" });
+    }
+
+    next();
 };
 
-// ─── Correct IntaSend API endpoint ────────────
-const INTASEND_API_URL = 'https://payment.intasend.com/api/v1/collection/mpesa_stk_push/';
+// Global rate limit
+let globalRequestCount = 0;
+let globalWindowStart = Date.now();
+const GLOBAL_MAX = 50;
+const GLOBAL_WINDOW = 60 * 1000;
 
-// ═════════════════════════════════════════════
-//  ENDPOINTS
-// ═════════════════════════════════════════════
+const globalRateLimit = (req, res, next) => {
+    const now = Date.now();
+    if (now - globalWindowStart > GLOBAL_WINDOW) {
+        globalRequestCount = 0;
+        globalWindowStart = now;
+    }
+    globalRequestCount++;
+    if (globalRequestCount > GLOBAL_MAX) {
+        return res.status(429).json({ error: "Global request limit reached. Please try again later." });
+    }
+    next();
+};
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'intasend-server' });
+// Apply middleware
+app.use('/api/pay', checkSecret);
+app.use('/api/retry-payment', checkSecret);
+app.use('/api/pay', globalRateLimit);
+app.use('/api/retry-payment', globalRateLimit);
+
+// IP blocking
+const violationStore = new Map();
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, data] of violationStore.entries()) {
+        if (data.blockUntil && data.blockUntil < now) {
+            violationStore.delete(ip);
+        } else if (!data.blockUntil && (now - data.firstViolationTime) > 3600000) {
+            violationStore.delete(ip);
+        }
+    }
+}, 60000);
+
+const checkBlocked = (req, res, next) => {
+    const ip = req.ip || req.connection.remoteAddress;
+    const now = Date.now();
+    const data = violationStore.get(ip);
+    if (data && data.blockUntil && data.blockUntil > now) {
+        return res.status(403).json({
+            error: `Your IP is temporarily blocked due to excessive failed attempts. Try again after ${Math.ceil((data.blockUntil - now) / 60000)} minutes.`
+        });
+    }
+    next();
+};
+
+const paymentLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000,
+    max: 3,
+    message: { error: "Too many payment requests from this IP. Please wait 5 minutes." },
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => {
+        const ip = req.ip || req.connection.remoteAddress;
+        const now = Date.now();
+        const data = violationStore.get(ip) || { count: 0, firstViolationTime: now, blockUntil: null };
+        data.count += 1;
+        if (data.count >= 3) {
+            data.blockUntil = now + 3600000;
+            violationStore.set(ip, data);
+            res.status(429).json({
+                error: "Too many failed payment attempts. Your IP has been blocked for 1 hour."
+            });
+        } else {
+            violationStore.set(ip, data);
+            res.status(429).json({
+                error: "Too many payment requests from this IP. Please wait 5 minutes."
+            });
+        }
+    }
 });
 
-app.get('/api/subscriptions/plans', (req, res) => {
-  res.json(PLANS);
+app.use('/api/pay', checkBlocked, paymentLimiter);
+app.use('/api/retry-payment', checkBlocked, paymentLimiter);
+
+// =============================================
+// 5. Root Route
+// =============================================
+app.get("/", (req, res) => {
+    res.send("sarahapay API Running – IntaSend Express");
 });
 
-app.get('/api/transactions', async (req, res) => {
-  try {
-    const txs = await Transaction.find().sort({ createdAt: -1 }).limit(100);
-    res.json(txs);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch transactions' });
-  }
-});
+// =============================================
+// 6. IntaSend Configuration
+// =============================================
+const INTASEND_API_KEY = process.env.INTASEND_API_KEY;
+const INTASEND_API_URL = process.env.INTASEND_API_URL || 'https://payment.intasend.com/api/v1/collection/mpesa_stk_push/';
 
-app.get('/api/transaction/:ref', async (req, res) => {
-  try {
-    const tx = await Transaction.findOne({ transactionRef: req.params.ref });
-    if (!tx) return res.status(404).json({ error: 'Not found' });
-    res.json(tx);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch' });
-  }
-});
+console.log(`📍 IntaSend API URL: ${INTASEND_API_URL}`);
 
-// ─── Initiate STK Push ──────────────────────
-app.post('/api/pay', async (req, res) => {
-  try {
-    const { phone, plan, userId, website, callbackUrl, amount } = req.body;
+// =============================================
+// 7. Helper: Initiate STK Push (IntaSend)
+// =============================================
+async function initiateStkPush(name, phone, amount, retryCount = 0) {
+    // Normalize phone number to 254XXXXXXXXX
+    let formattedPhone = phone
+        .replace(/\s+/g, '')
+        .replace(/^\+/, '')
+        .replace(/^0/, '254');
 
-    if (!phone) {
-      return res.status(400).json({ error: 'Phone number is required' });
+    if (!formattedPhone.startsWith('254')) {
+        formattedPhone = '254' + formattedPhone;
     }
 
-    let finalAmount = amount;
-    let planName = plan || 'basic';
-    if (!finalAmount) {
-      if (!PLANS[planName]) {
-        return res.status(400).json({ error: 'Invalid plan or amount missing' });
-      }
-      finalAmount = PLANS[planName].price;
-    }
+    const apiRef = `PAY-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 
-    const transactionRef = `PAY-${uuidv4().slice(0, 8).toUpperCase()}`;
-
-    const tx = new Transaction({
-      userId: userId || 'unknown',
-      plan: planName,
-      phone,
-      amount: finalAmount,
-      transactionRef,
-      website: website || 'sarahapay',
-      callbackUrl: callbackUrl || '',
-      status: 'pending'
-    });
-    await tx.save();
-
-    // ── Call IntaSend API ────────────────────
-    const requestBody = {
-      phone_number: phone,
-      amount: finalAmount,
-      api_ref: transactionRef,
-      purpose: `Payment for ${planName} plan`
+    const payload = {
+        phone_number: formattedPhone,
+        amount: parseFloat(amount).toFixed(2),
+        api_ref: apiRef,
+        purpose: `Payment from ${name || 'Sarahapay'}`,
+        email: process.env.INTASEND_EMAIL || 'customer@sarahapay.com',
+        first_name: name || 'Sarahapay'
     };
 
-    console.log('📤 Sending to IntaSend:', JSON.stringify(requestBody, null, 2));
-    console.log('📍 URL:', INTASEND_API_URL);
-
-    const response = await axios.post(INTASEND_API_URL, requestBody, {
-      headers: {
-        'Authorization': `Bearer ${process.env.INTASEND_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
+    console.log("📤 IntaSend STK Request:", {
+        phone: payload.phone_number,
+        amount: payload.amount,
+        api_ref: payload.api_ref
     });
 
-    const intaResponse = response.data;
-    console.log('📥 IntaSend response:', JSON.stringify(intaResponse, null, 2));
+    try {
+        const response = await axios.post(INTASEND_API_URL, payload, {
+            headers: {
+                'Authorization': `Bearer ${INTASEND_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 15000
+        });
 
-    // Check for errors
-    if (intaResponse.status && intaResponse.status !== 'success') {
-      tx.status = 'failed';
-      await tx.save();
-      return res.status(400).json({
-        error: 'STK push failed',
-        details: intaResponse.message || 'Unknown error'
-      });
-    }
+        console.log("📥 IntaSend Response:", response.data);
 
-    const checkoutId = intaResponse.id || intaResponse.checkout_id || null;
-    if (checkoutId) {
-      tx.checkoutId = checkoutId;
-      await tx.save();
-    }
+        const data = response.data;
 
-    res.json({
-      success: true,
-      message: 'STK push sent. Check your phone.',
-      transactionRef,
-      checkoutId,
-      transactionId: tx._id,
-      rawResponse: intaResponse
-    });
-
-  } catch (error) {
-    console.error('❌ STK Push error:', error.message);
-    if (error.response) {
-      console.error('Status:', error.response.status);
-      console.error('Response data:', error.response.data);
-    }
-    res.status(500).json({
-      error: 'Failed to initiate payment',
-      details: error.response?.data || error.message
-    });
-  }
-});
-
-// ─── IntaSend Webhook Handler ───────────────
-app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
-  try {
-    const payload = req.body;
-    console.log('📥 Webhook received:', JSON.stringify(payload, null, 2));
-
-    const { id, state, reference, mpesa_receipt_number, status } = payload;
-
-    const tx = await Transaction.findOne({
-      $or: [
-        { checkoutId: id },
-        { transactionRef: reference }
-      ]
-    });
-
-    if (!tx) {
-      console.warn(`⚠️ No transaction found for id: ${id} or ref: ${reference}`);
-      return res.status(404).json({ error: 'Transaction not found' });
-    }
-
-    const isSuccess = state === 'completed' || status === 'success';
-
-    if (isSuccess) {
-      tx.status = 'completed';
-      tx.mpesaReceipt = mpesa_receipt_number;
-      tx.updatedAt = new Date();
-      await tx.save();
-      console.log(`✅ Payment confirmed for transaction ${tx.transactionRef}`);
-
-      if (tx.callbackUrl) {
-        try {
-          await axios.post(tx.callbackUrl, {
-            transactionRef: tx.transactionRef,
-            userId: tx.userId,
-            plan: tx.plan,
-            status: 'completed',
-            mpesaReceipt: tx.mpesaReceipt,
-            amount: tx.amount,
-            phone: tx.phone
-          }, { timeout: 10000 });
-          console.log(`✅ Notified ${tx.callbackUrl}`);
-        } catch (callbackErr) {
-          console.error(`❌ Failed to notify callback:`, callbackErr.message);
+        if (data.status && data.status !== 'success') {
+            throw new Error(data.message || 'IntaSend STK push failed');
         }
-      }
-    } else {
-      tx.status = 'failed';
-      tx.updatedAt = new Date();
-      await tx.save();
-      console.log(`❌ Payment failed for transaction ${tx.transactionRef}`);
-    }
 
-    res.status(200).send('OK');
-  } catch (error) {
-    console.error('❌ Webhook error:', error);
-    res.status(500).json({ error: 'Webhook processing failed' });
-  }
+        const checkoutId = data.id || data.checkout_id || data.checkoutId || null;
+
+        if (!checkoutId) {
+            throw new Error('No checkout ID returned from IntaSend');
+        }
+
+        const tx = new Transaction({
+            name: name || 'IntaSend Payment',
+            phone: formattedPhone,
+            amount: parseFloat(amount).toFixed(2),
+            checkout_id: checkoutId,
+            retryCount: retryCount,
+            lastRetryAt: new Date()
+        });
+        await tx.save();
+
+        return tx;
+
+    } catch (error) {
+        if (error.response) {
+            console.error("❌ IntaSend API error:", error.response.status, error.response.data);
+            throw new Error(error.response.data?.message || error.response.data?.detail || 'IntaSend API error');
+        }
+        throw error;
+    }
+}
+
+// =============================================
+// 8. Initiate Payment Endpoint
+// =============================================
+app.post("/api/pay", async (req, res) => {
+    try {
+        const { name, phone, amount } = req.body;
+        if (!name || !phone || !amount) {
+            return res.status(400).json({ error: "Name, phone and amount required" });
+        }
+
+        let formattedPhone = phone
+            .replace(/\s+/g, '')
+            .replace(/^\+/, '')
+            .replace(/^0/, '254');
+
+        const lastTx = await Transaction.findOne({ phone: formattedPhone })
+            .sort({ createdAt: -1 });
+
+        if (lastTx && lastTx.status === "PENDING") {
+            const secondsSince = (Date.now() - new Date(lastTx.createdAt).getTime()) / 1000;
+            if (secondsSince > 30) {
+                await Transaction.updateOne(
+                    { _id: lastTx._id },
+                    { status: "FAILED" }
+                );
+                console.log(`Auto‑cleaned stale pending transaction ${lastTx._id} after 30s`);
+            } else {
+                return res.status(409).json({
+                    error: "You already have a pending payment. Please wait or check your phone."
+                });
+            }
+        }
+
+        if (lastTx && (lastTx.status === "FAILED" || lastTx.status === "CANCELLED")) {
+            const retryCount = lastTx.retryCount || 0;
+            const secondsSinceLast = (Date.now() - new Date(lastTx.lastRetryAt || lastTx.createdAt).getTime()) / 1000;
+
+            if (retryCount >= 5) {
+                if (secondsSinceLast < 30) {
+                    return res.status(429).json({
+                        error: `Too many failed attempts (${retryCount}). Please wait ${Math.ceil(30 - secondsSinceLast)} seconds before trying again.`
+                    });
+                } else {
+                    await Transaction.updateOne({ _id: lastTx._id }, { retryCount: 0 });
+                }
+            }
+        }
+
+        const tx = await initiateStkPush(name, formattedPhone, amount, lastTx?.retryCount || 0);
+        res.status(201).json({
+            message: "STK Push Sent",
+            transactionId: tx._id
+        });
+
+    } catch (error) {
+        console.error("STK Push Error:", error.message);
+        res.status(500).json({
+            error: "Failed to initiate payment",
+            details: error.message
+        });
+    }
 });
 
-// ─── Start Server ────────────────────────────
+// =============================================
+// 9. Retry Payment Endpoint
+// =============================================
+app.post("/api/retry-payment", async (req, res) => {
+    try {
+        const { phone } = req.body;
+        if (!phone) {
+            return res.status(400).json({ error: "Phone number required" });
+        }
+
+        let formattedPhone = phone
+            .replace(/\s+/g, '')
+            .replace(/^\+/, '')
+            .replace(/^0/, '254');
+
+        const lastTx = await Transaction.findOne({
+            phone: formattedPhone,
+            status: { $in: ["PENDING", "FAILED", "CANCELLED"] }
+        }).sort({ createdAt: -1 });
+
+        if (!lastTx) {
+            return res.status(404).json({ error: "No failed or pending transaction found to retry" });
+        }
+
+        const retryCount = lastTx.retryCount || 0;
+        const secondsSinceLast = (Date.now() - new Date(lastTx.lastRetryAt || lastTx.createdAt).getTime()) / 1000;
+
+        if (retryCount >= 5) {
+            if (secondsSinceLast < 30) {
+                return res.status(429).json({
+                    error: `Retry limit reached (${retryCount}). Please wait ${Math.ceil(30 - secondsSinceLast)} seconds before trying again.`
+                });
+            } else {
+                await Transaction.updateOne({ _id: lastTx._id }, { retryCount: 0 });
+            }
+        }
+
+        await Transaction.updateOne(
+            { _id: lastTx._id },
+            { status: "FAILED", lastRetryAt: new Date() }
+        );
+
+        const newTx = await initiateStkPush(
+            lastTx.name,
+            formattedPhone,
+            lastTx.amount,
+            retryCount + 1
+        );
+
+        res.status(201).json({
+            message: "Retry initiated. Check your phone for the M-PESA prompt.",
+            transactionId: newTx._id,
+            retryCount: retryCount + 1
+        });
+
+    } catch (error) {
+        console.error("Retry payment error:", error);
+        res.status(500).json({
+            error: "Failed to retry payment",
+            details: error.message
+        });
+    }
+});
+
+// =============================================
+// 10. Fetch Transactions
+// =============================================
+app.get("/api/transactions", async (req, res) => {
+    try {
+        const transactions = await Transaction.find().sort({ createdAt: -1 });
+        res.json(transactions);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to fetch transactions" });
+    }
+});
+
+// =============================================
+// 11. Get Single Transaction by ID
+// =============================================
+app.get("/api/transaction/:id", async (req, res) => {
+    try {
+        const transaction = await Transaction.findById(req.params.id);
+        if (!transaction) {
+            return res.status(404).json({ error: "Transaction not found" });
+        }
+        res.json(transaction);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to fetch transaction" });
+    }
+});
+
+// =============================================
+// 12. IntaSend Webhook (Callback)
+// =============================================
+app.post("/callback", async (req, res) => {
+    console.log("========================================");
+    console.log("🔔 INTASEND CALLBACK RECEIVED");
+    console.log("📌 Headers:", req.headers);
+    console.log("📌 Body:", req.body);
+    console.log("========================================");
+
+    // Always respond with 200 to acknowledge receipt
+    res.sendStatus(200);
+
+    // Process asynchronously (so we don't block IntaSend)
+    (async () => {
+        try {
+            const payload = req.body;
+
+            const checkoutId = payload.id || payload.checkout_id || payload.checkoutId;
+            const state = payload.state || payload.status;
+            const mpesaReceipt = payload.mpesa_receipt_number || payload.receipt || payload.transaction_receipt;
+            const transactionRef = payload.reference || payload.api_ref || payload.transactionRef;
+
+            console.log(`📊 Status: ${state}, Checkout ID: ${checkoutId}, Receipt: ${mpesaReceipt}`);
+
+            if (!checkoutId) {
+                console.error("❌ No checkout ID in callback payload");
+                return;
+            }
+
+            let transaction = await Transaction.findOne({ checkout_id: checkoutId });
+
+            if (!transaction && transactionRef) {
+                transaction = await Transaction.findOne({ checkout_id: transactionRef });
+            }
+
+            if (!transaction && payload.phone && payload.amount) {
+                transaction = await Transaction.findOne({
+                    phone: payload.phone,
+                    amount: String(payload.amount)
+                }).sort({ createdAt: -1 });
+            }
+
+            if (!transaction) {
+                console.error(`❌ No transaction found for checkoutId: ${checkoutId}`);
+                return;
+            }
+
+            let status = 'FAILED';
+            if (state === 'completed' || state === 'success' || state === 'COMPLETED') {
+                status = 'SUCCESS';
+            } else if (state === 'pending' || state === 'PENDING') {
+                status = 'PENDING';
+            }
+
+            transaction.status = status;
+            if (mpesaReceipt) {
+                transaction.mpesa_receipt = mpesaReceipt;
+            }
+            if (checkoutId && transaction.checkout_id !== checkoutId) {
+                transaction.checkout_id = checkoutId;
+            }
+            await transaction.save();
+            console.log(`✅ Transaction ${transaction._id} updated to ${status}`);
+
+            if (status === 'SUCCESS') {
+                const callbackPayload = {
+                    checkout_id: transaction.checkout_id,
+                    status: 'paid',
+                    mpesa_receipt: mpesaReceipt || transaction.mpesa_receipt,
+                    amount: transaction.amount,
+                    phone: transaction.phone,
+                    name: transaction.name,
+                    reference: transactionRef || transaction._id.toString()
+                };
+
+                const RENTSPACE_WEBHOOK_URL = process.env.RENTSPACE_WEBHOOK_URL || 'https://rentspace-markeplace.onrender.com/api/subscriptions/saraha-webhook';
+                try {
+                    await axios.post(RENTSPACE_WEBHOOK_URL, callbackPayload, { timeout: 5000 });
+                    console.log(`✅ Forwarded callback to RentSpace: ${RENTSPACE_WEBHOOK_URL}`);
+                } catch (err) {
+                    console.error('❌ Failed to forward callback to RentSpace:', err.message);
+                }
+            }
+        } catch (err) {
+            console.error("❌ Error processing callback:", err);
+        }
+    })();
+});
+
+// =============================================
+// 13. Start Server
+// =============================================
 app.listen(PORT, () => {
-  console.log(`🚀 IntaSend server running on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
