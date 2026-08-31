@@ -58,7 +58,6 @@ app.use(cors({
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
-app.use(express.static("docs"));
 
 // =============================================
 // 4. Security Middleware
@@ -164,14 +163,21 @@ app.use('/api/pay', checkBlocked, paymentLimiter);
 app.use('/api/retry-payment', checkBlocked, paymentLimiter);
 
 // =============================================
-// 5. Root Route
+// 5. Root Route (API info)
 // =============================================
 app.get("/", (req, res) => {
     res.send("sarahapay API Running – IntaSend Express");
 });
 
 // =============================================
-// 6. IntaSend Configuration
+// 6. Health Check Endpoint (NEW)
+// =============================================
+app.get("/api/health", (req, res) => {
+    res.json({ status: 'ok', service: 'intasend-server' });
+});
+
+// =============================================
+// 7. IntaSend Configuration
 // =============================================
 const INTASEND_API_KEY = process.env.INTASEND_API_KEY;
 const INTASEND_API_URL = process.env.INTASEND_API_URL || 'https://payment.intasend.com/api/v1/collection/mpesa_stk_push/';
@@ -179,7 +185,7 @@ const INTASEND_API_URL = process.env.INTASEND_API_URL || 'https://payment.intase
 console.log(`📍 IntaSend API URL: ${INTASEND_API_URL}`);
 
 // =============================================
-// 7. Helper: Initiate STK Push (IntaSend)
+// 8. Helper: Initiate STK Push (IntaSend)
 // =============================================
 async function initiateStkPush(name, phone, amount, retryCount = 0) {
     // Normalize phone number to 254XXXXXXXXX
@@ -254,7 +260,7 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
 }
 
 // =============================================
-// 8. Initiate Payment Endpoint
+// 9. Initiate Payment Endpoint
 // =============================================
 app.post("/api/pay", async (req, res) => {
     try {
@@ -317,7 +323,7 @@ app.post("/api/pay", async (req, res) => {
 });
 
 // =============================================
-// 9. Retry Payment Endpoint
+// 10. Retry Payment Endpoint
 // =============================================
 app.post("/api/retry-payment", async (req, res) => {
     try {
@@ -381,7 +387,7 @@ app.post("/api/retry-payment", async (req, res) => {
 });
 
 // =============================================
-// 10. Fetch Transactions
+// 11. Fetch Transactions
 // =============================================
 app.get("/api/transactions", async (req, res) => {
     try {
@@ -393,7 +399,7 @@ app.get("/api/transactions", async (req, res) => {
 });
 
 // =============================================
-// 11. Get Single Transaction by ID
+// 12. Get Single Transaction by ID
 // =============================================
 app.get("/api/transaction/:id", async (req, res) => {
     try {
@@ -408,7 +414,7 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 // =============================================
-// 12. IntaSend Webhook (Callback)
+// 13. IntaSend Webhook (Callback)
 // =============================================
 app.post("/callback", async (req, res) => {
     console.log("========================================");
@@ -498,7 +504,22 @@ app.post("/callback", async (req, res) => {
 });
 
 // =============================================
-// 13. Start Server
+// 14. Alias for IntaSend webhook (backward compatibility)
+//     This forwards the request to the /callback handler
+// =============================================
+app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
+    // Forward to the /callback handler
+    req.url = '/callback';
+    app._router.handle(req, res);
+});
+
+// =============================================
+// 15. Static files (served LAST to avoid hijacking routes)
+// =============================================
+app.use(express.static("docs"));
+
+// =============================================
+// 16. Start Server
 // =============================================
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
