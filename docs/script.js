@@ -1,11 +1,9 @@
 // =============================================
-// INTASEND PAYMENT SCRIPT
+// INTASEND PAYMENT SCRIPT – Fixed Version
 // =============================================
 
 // ─── Constants ──────────────────────────────────
-// Update these to match your new backend
-const API_BASE = 'https://sarahapay-intasend.onrender.com'; // ← UPDATE THIS
-const API_SECRET = process.env.INTASEND_SECRET_KEY || 'your_intasend_secret_key'; // ← UPDATE
+const API_BASE = 'https://sarahapay-intasend.onrender.com'; // your deployed backend
 const RECAPTCHA_SITE_KEY = '6LcKDGEtAAAAAJKAWjXB7j5bSIPvzz94wBWapTD5';
 
 // ─── Helper Functions ──────────────────────────
@@ -39,13 +37,30 @@ function startCooldownTimer(seconds) {
 
 // ─── Main Payment Function ─────────────────────
 async function handlePayment() {
-    const phone = document.getElementById("phone").value.trim();
-    const plan = document.getElementById("plan").value;
-    const userId = document.getElementById("userId").value || 'demo_user';
+    // Get form values
+    const phoneInput = document.getElementById("phone");
+    const amountInput = document.getElementById("amount");
+    const planInput = document.getElementById("plan");
+    const userIdInput = document.getElementById("userId");
 
+    // Validate phone
+    const phone = phoneInput ? phoneInput.value.trim() : '';
     if (!phone) {
         alert("Please enter your phone number");
         return;
+    }
+
+    // Get plan and userId (with defaults)
+    const plan = planInput ? planInput.value : 'basic';
+    const userId = userIdInput ? userIdInput.value : 'demo_user';
+
+    // Get amount (if present), otherwise the server will use plan price
+    let amount = null;
+    if (amountInput) {
+        const rawAmount = parseFloat(amountInput.value);
+        if (!isNaN(rawAmount) && rawAmount > 0) {
+            amount = rawAmount;
+        }
     }
 
     // Format phone to 254XXXXXXXXX
@@ -60,37 +75,46 @@ async function handlePayment() {
     showStatus("Sending M-Pesa prompt...", "blue");
 
     try {
-        // Get reCAPTCHA token
-        const recaptchaToken = await grecaptcha.execute(RECAPTCHA_SITE_KEY, { action: 'payment' });
+        // Get reCAPTCHA token (if available)
+        let recaptchaToken = '';
+        if (typeof grecaptcha !== 'undefined') {
+            recaptchaToken = await grecaptcha.execute(RECAPTCHA_SITE_KEY, { action: 'payment' });
+        }
+
+        // Build request payload
+        const payload = {
+            phone: formattedPhone,
+            plan: plan,
+            userId: userId
+        };
+        if (amount !== null) {
+            payload.amount = amount;
+        }
+        // Optionally add callbackUrl if you have one
+        // payload.callbackUrl = 'https://your-app.com/api/payment-confirmation';
 
         const response = await fetch(`${API_BASE}/api/pay`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "X-API-Secret": API_SECRET,
                 "X-Recaptcha-Token": recaptchaToken
             },
-            body: JSON.stringify({ 
-                phone: formattedPhone, 
-                plan: plan, 
-                userId: userId 
-            })
+            body: JSON.stringify(payload)
         });
 
         const data = await response.json();
 
         if (response.ok) {
             showStatus("✅ STK Push sent! Check your phone for the M-Pesa prompt.", "success");
-            // Hide retry button if exists
-            const rb = document.getElementById("retryBtn");
-            if (rb) rb.remove();
             setPayButton(false, "Pay Now");
-            
             // Store transaction reference for status checking
-            localStorage.setItem('lastTransactionRef', data.transactionRef);
+            if (data.transactionRef) {
+                localStorage.setItem('lastTransactionRef', data.transactionRef);
+            }
         } else {
             const errorMsg = data.error || data.details || "Payment failed";
             
+            // Handle specific status codes
             if (response.status === 409) {
                 showStatus("You already have a pending payment. Check your phone or wait a few minutes.", "error");
                 startCooldownTimer(30);
@@ -118,11 +142,21 @@ async function checkTransactionStatus() {
 
     try {
         const response = await fetch(`${API_BASE}/api/transaction/${ref}`);
+        if (!response.ok) {
+            // If not found or error, maybe clear storage
+            if (response.status === 404) {
+                localStorage.removeItem('lastTransactionRef');
+                showStatus("Transaction not found. Please try again.", "error");
+                setPayButton(false, "Pay Now");
+            }
+            return;
+        }
         const data = await response.json();
         
         if (data.status === 'completed') {
             showStatus("✅ Payment confirmed! Thank you.", "success");
             localStorage.removeItem('lastTransactionRef');
+            setPayButton(false, "Pay Now");
         } else if (data.status === 'failed') {
             showStatus("❌ Payment failed. Please try again.", "error");
             localStorage.removeItem('lastTransactionRef');
@@ -133,6 +167,8 @@ async function checkTransactionStatus() {
         }
     } catch (err) {
         console.error('Status check failed:', err);
+        // Retry after a longer delay
+        setTimeout(checkTransactionStatus, 20000);
     }
 }
 
@@ -141,6 +177,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const ref = localStorage.getItem('lastTransactionRef');
     if (ref) {
         showStatus("Checking payment status...", "blue");
+        setPayButton(true, "Processing...");
+        // Wait a bit before first check
         setTimeout(checkTransactionStatus, 3000);
     }
 });

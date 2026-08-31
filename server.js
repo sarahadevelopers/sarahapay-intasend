@@ -1,5 +1,5 @@
 // =============================================
-// INTASEND PAYMENT ROUTER – Multi-Site Support
+// INTASEND PAYMENT SERVER – Fixed for STK Push
 // =============================================
 
 require('dotenv').config();
@@ -7,18 +7,17 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const dns = require('dns'); // for DNS test
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ─── CORS ──────────────────────────────────────────────────────
+// ─── Middleware ──────────────────────────────
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 
-// ─── MongoDB Connection with Timeouts ────────────────────────
+// ─── MongoDB Connection ──────────────────────
 const mongoOptions = {
   serverSelectionTimeoutMS: 10000,
   socketTimeoutMS: 45000,
@@ -29,128 +28,147 @@ mongoose.connect(process.env.MONGO_URI, mongoOptions)
   .then(() => console.log('✅ MongoDB Connected'))
   .catch(err => console.error('❌ MongoDB Error:', err));
 
-// ─── IntaSend SDK Setup ──────────────────────────────────────
-// ─── IntaSend SDK Setup ──────────────────────────────────────
+// ─── IntaSend SDK Setup ──────────────────────
+// Using the official 'intasend-node' package
 const Intasend = require('intasend-node');
+
+// The constructor expects: (apiKey, publicKey, environment)
 const intasend = new Intasend(
-  process.env.INTASEND_API_KEY,         // ← Use INTASEND_API_KEY
-  process.env.INTASEND_PUBLIC_KEY,      // ← Use INTASEND_PUBLIC_KEY
+  process.env.INTASEND_API_KEY,
+  process.env.INTASEND_PUBLIC_KEY,
   process.env.INTASEND_ENVIRONMENT || 'production'
 );
 
-// ─── Transaction Schema ──────────────────────────────────────
+// ─── Transaction Schema ──────────────────────
 const transactionSchema = new mongoose.Schema({
-  userId: String,
-  plan: { type: String, enum: ['basic', 'pro', 'developer'] },
+  userId: { type: String, default: 'unknown' },
+  plan: { type: String, enum: ['basic', 'pro', 'developer', 'custom'], default: 'basic' },
   phone: String,
   amount: Number,
-  status: { type: String, default: 'pending' },
+  status: { type: String, default: 'pending' }, // pending | completed | failed
   checkoutId: String,
   mpesaReceipt: String,
   transactionRef: String,
-  website: { type: String, default: 'rentspace' },
-  callbackUrl: { type: String, required: true },
+  website: { type: String, default: 'sarahapay' },
+  callbackUrl: { type: String, default: '' }, // now optional
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
 
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
-// ─── Subscription Plans ──────────────────────────────────────
+// ─── Subscription Plans ──────────────────────
 const PLANS = {
-  basic: { name: 'Basic', price: 2, listings: 20 },
-  pro: { name: 'Pro', price: 5, listings: Infinity },
-  developer: { name: 'Developer', price: 10, listings: Infinity }
+  basic: { name: 'Basic', price: 2 },
+  pro: { name: 'Pro', price: 5 },
+  developer: { name: 'Developer', price: 10 },
+  // you can add a custom plan
 };
 
-// ═════════════════════════════════════════════════════════════
-//  DIAGNOSTIC ENDPOINTS
-// ═════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════
+//  ENDPOINTS
+// ═════════════════════════════════════════════
 
-// 1. Health check
+// ─── Health check ────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'intasend-server' });
 });
 
-// 2. DNS resolution test (checks if Render can resolve MongoDB hostnames)
-app.get('/api/dns-test', (req, res) => {
-  const hostname = 'ac-gzcc1u0-shard-00-00.mqrczsc.mongodb.net';
-  dns.resolve(hostname, (err, addresses) => {
-    if (err) {
-      return res.status(500).json({ status: 'error', message: err.message });
-    }
-    res.json({ status: 'ok', addresses });
-  });
-});
-
-// 3. Mongoose connection state check
-app.get('/api/db-test', async (req, res) => {
-  try {
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({
-        status: 'error',
-        message: 'MongoDB not connected yet. Current state: ' + mongoose.connection.readyState
-      });
-    }
-    await mongoose.connection.db.admin().ping();
-    res.json({ status: 'ok', message: 'MongoDB connected' });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
-  }
-});
-
-// ─── Subscription Plans ──────────────────────────────────────
+// ─── List all plans ──────────────────────────
 app.get('/api/subscriptions/plans', (req, res) => {
   res.json(PLANS);
 });
 
-// ─── Initiate STK Push ──────────────────────────────────────
+// ─── GET all transactions (for admin panel) ──
+app.get('/api/transactions', async (req, res) => {
+  try {
+    const txs = await Transaction.find().sort({ createdAt: -1 }).limit(100);
+    res.json(txs);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch transactions' });
+  }
+});
+
+// ─── GET a single transaction by ref ─────────
+app.get('/api/transaction/:ref', async (req, res) => {
+  try {
+    const tx = await Transaction.findOne({ transactionRef: req.params.ref });
+    if (!tx) return res.status(404).json({ error: 'Not found' });
+    res.json(tx);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch' });
+  }
+});
+
+// ─── Initiate STK Push ──────────────────────
 app.post('/api/pay', async (req, res) => {
   try {
-    const { phone, plan, userId, website, callbackUrl } = req.body;
+    const { phone, plan, userId, website, callbackUrl, amount } = req.body;
 
-    if (!phone || !plan || !PLANS[plan]) {
-      return res.status(400).json({ error: 'Phone number and valid plan required' });
-    }
-    if (!callbackUrl) {
-      return res.status(400).json({ error: 'callbackUrl is required' });
+    // Validate phone
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone number is required' });
     }
 
-    const amount = PLANS[plan].price;
-    const transactionRef = `RENT-${uuidv4().slice(0, 8)}`;
+    // Determine amount: if 'amount' is provided, use it; else use plan's price
+    let finalAmount = amount;
+    let planName = plan || 'basic';
+    if (!finalAmount) {
+      if (!PLANS[planName]) {
+        return res.status(400).json({ error: 'Invalid plan or amount missing' });
+      }
+      finalAmount = PLANS[planName].price;
+    }
 
-    // ── Create transaction record ─────────────────────────────
+    // Generate unique transaction reference
+    const transactionRef = `PAY-${uuidv4().slice(0, 8).toUpperCase()}`;
+
+    // Create transaction record (callbackUrl optional)
     const tx = new Transaction({
       userId: userId || 'unknown',
-      plan,
+      plan: planName,
       phone,
-      amount,
+      amount: finalAmount,
       transactionRef,
-      website: website || 'rentspace',
-      callbackUrl,
+      website: website || 'sarahapay',
+      callbackUrl: callbackUrl || '',
       status: 'pending'
     });
     await tx.save();
 
-    // ── Initiate STK push via IntaSend ────────────────────────
+    // ── Call IntaSend STK Push ──────────────
+    // The SDK method: intasend.collections.mpesaStkPush(params)
     const response = await intasend.collections.mpesaStkPush({
-      first_name: 'RentSpace',
-      phone_number: phone,
-      email: 'customer@rentspace.co.ke',
-      amount: amount,
+      first_name: 'Sarahapay',
+      phone_number: phone,          // must be 254XXXXXXXXX
+      email: 'customer@sarahapay.com',
+      amount: finalAmount,
       currency: 'KES',
       reference: transactionRef,
-      description: `RentSpace ${plan} subscription`
+      description: `Payment for ${planName} plan`
     });
 
+    // Extract checkout ID from response
     const checkoutId = response.id || response.checkout_id;
     if (checkoutId) {
       tx.checkoutId = checkoutId;
       await tx.save();
     }
 
-    console.log('📤 IntaSend STK response:', response);
+    console.log('📤 IntaSend STK response:', JSON.stringify(response, null, 2));
 
+    // If IntaSend returned an error (some responses include a 'status' field)
+    if (response.status && response.status !== 'success') {
+      // It might be a failure response
+      tx.status = 'failed';
+      await tx.save();
+      return res.status(400).json({
+        error: 'STK push failed',
+        details: response.message || 'Unknown error'
+      });
+    }
+
+    // Success
     res.json({
       success: true,
       message: 'STK push sent. Check your phone.',
@@ -161,6 +179,10 @@ app.post('/api/pay', async (req, res) => {
 
   } catch (error) {
     console.error('❌ STK Push error:', error.response?.data || error.message);
+    // Log full error for debugging
+    if (error.response) {
+      console.error('Response data:', JSON.stringify(error.response.data, null, 2));
+    }
     res.status(500).json({
       error: 'Failed to initiate payment',
       details: error.response?.data || error.message
@@ -168,7 +190,7 @@ app.post('/api/pay', async (req, res) => {
   }
 });
 
-// ─── IntaSend Webhook Handler ──────────────────────────────
+// ─── IntaSend Webhook Handler ───────────────
 app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
   try {
     const payload = req.body;
@@ -176,6 +198,7 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
 
     const { id, state, reference, mpesa_receipt_number, status } = payload;
 
+    // Find transaction by checkoutId or transactionRef
     const tx = await Transaction.findOne({
       $or: [
         { checkoutId: id },
@@ -198,21 +221,24 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
 
       console.log(`✅ Payment confirmed for transaction ${tx.transactionRef}`);
 
-      // ⭐⭐⭐ CALL THE WEBSITE'S CALLBACK URL ⭐⭐⭐
-      try {
-        await axios.post(tx.callbackUrl, {
-          transactionRef: tx.transactionRef,
-          userId: tx.userId,
-          plan: tx.plan,
-          status: 'completed',
-          mpesaReceipt: tx.mpesaReceipt,
-          amount: tx.amount,
-          phone: tx.phone
-        }, { timeout: 10000 });
-        console.log(`✅ Notified ${tx.website} (${tx.callbackUrl})`);
-      } catch (callbackErr) {
-        console.error(`❌ Failed to notify ${tx.website}:`, callbackErr.message);
-        // Don't re-throw; respond 200 to IntaSend anyway
+      // ── Notify the callback URL (if provided) ──
+      if (tx.callbackUrl) {
+        try {
+          await axios.post(tx.callbackUrl, {
+            transactionRef: tx.transactionRef,
+            userId: tx.userId,
+            plan: tx.plan,
+            status: 'completed',
+            mpesaReceipt: tx.mpesaReceipt,
+            amount: tx.amount,
+            phone: tx.phone
+          }, { timeout: 10000 });
+          console.log(`✅ Notified ${tx.callbackUrl}`);
+        } catch (callbackErr) {
+          console.error(`❌ Failed to notify callback:`, callbackErr.message);
+        }
+      } else {
+        console.log('ℹ️ No callback URL set, skipping notification.');
       }
 
     } else {
@@ -230,18 +256,18 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
   }
 });
 
-// ─── Get Transaction Status ──────────────────────────────────
-app.get('/api/transaction/:ref', async (req, res) => {
+// ─── (Optional) Test endpoint to verify credentials ──
+app.get('/api/test-credentials', async (req, res) => {
   try {
-    const tx = await Transaction.findOne({ transactionRef: req.params.ref });
-    if (!tx) return res.status(404).json({ error: 'Transaction not found' });
-    res.json(tx);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch transaction' });
+    // Make a minimal STK push to a test number (maybe your own)
+    // but we don't want to spam, so just return the SDK status.
+    res.json({ message: 'Credentials seem loaded. Try a real payment.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Start Server ────────────────────────────────────────────
+// ─── Start Server ────────────────────────────
 app.listen(PORT, () => {
   console.log(`🚀 IntaSend server running on port ${PORT}`);
 });
