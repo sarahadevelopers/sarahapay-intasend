@@ -53,8 +53,9 @@ const PLANS = {
   developer: { name: 'Developer', price: 10 },
 };
 
-// ─── IntaSend API base URL ───────────────────
-const INTASEND_API_URL = 'https://api.intasend.com/api/v1/payments/mpesa/stk_push/';
+// ─── Correct IntaSend API endpoint ────────────
+// Using the official production endpoint (without trailing slash to avoid 404)
+const INTASEND_API_URL = 'https://api.intasend.com/api/v1/payments/mpesa/stk_push';
 
 // ═════════════════════════════════════════════
 //  ENDPOINTS
@@ -135,6 +136,8 @@ app.post('/api/pay', async (req, res) => {
       purpose: `Payment for ${planName} plan`
     };
 
+    console.log('📤 Sending to IntaSend:', JSON.stringify(requestBody, null, 2));
+
     const response = await axios.post(INTASEND_API_URL, requestBody, {
       headers: {
         'Authorization': `Bearer ${process.env.INTASEND_API_KEY}`,
@@ -143,7 +146,7 @@ app.post('/api/pay', async (req, res) => {
     });
 
     const intaResponse = response.data;
-    console.log('📤 IntaSend response:', JSON.stringify(intaResponse, null, 2));
+    console.log('📥 IntaSend response:', JSON.stringify(intaResponse, null, 2));
 
     // Check if IntaSend returned an error
     if (intaResponse.status && intaResponse.status !== 'success') {
@@ -173,9 +176,17 @@ app.post('/api/pay', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ STK Push error:', error.response?.data || error.message);
+    console.error('❌ STK Push error:', error.message);
     if (error.response) {
-      console.error('Response data:', JSON.stringify(error.response.data, null, 2));
+      console.error('Status:', error.response.status);
+      console.error('Response data:', error.response.data);
+      // If it's HTML, we extract the error message from the 404 page
+      if (typeof error.response.data === 'string' && error.response.data.includes('404')) {
+        return res.status(500).json({
+          error: 'Failed to initiate payment',
+          details: 'The IntaSend API endpoint returned a 404. Please check the URL or your API key.'
+        });
+      }
     }
     res.status(500).json({
       error: 'Failed to initiate payment',
