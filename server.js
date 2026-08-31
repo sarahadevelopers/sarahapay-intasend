@@ -1,5 +1,5 @@
 // =============================================
-// INTASEND PAYMENT SERVER – Using Official SDK
+// INTASEND PAYMENT SERVER – Direct API Call
 // =============================================
 
 require('dotenv').config();
@@ -53,18 +53,8 @@ const PLANS = {
   developer: { name: 'Developer', price: 10 },
 };
 
-// ─── IntaSend SDK Setup ──────────────────────
-const Intasend = require('intasend-node');
-
-// The SDK constructor expects: (apiKey, publicKey, environment)
-// Use the correct environment: 'production' or 'sandbox'
-const intasend = new Intasend(
-  process.env.INTASEND_API_KEY,
-  process.env.INTASEND_PUBLIC_KEY,
-  process.env.INTASEND_ENVIRONMENT || 'production'
-);
-
-console.log('✅ IntaSend SDK initialized');
+// ─── Correct IntaSend API endpoint ────────────
+const INTASEND_API_URL = 'https://payment.intasend.com/api/v1/collection/mpesa_stk_push/';
 
 // ═════════════════════════════════════════════
 //  ENDPOINTS
@@ -129,36 +119,38 @@ app.post('/api/pay', async (req, res) => {
     });
     await tx.save();
 
-    // ── Initiate STK push using the SDK ──────
-    // The method is intasend.collections.mpesaStkPush(params)
-    const stkParams = {
-      first_name: 'Sarahapay',
-      phone_number: phone,          // 254XXXXXXXXX
-      email: 'customer@sarahapay.com',
+    // ── Call IntaSend API ────────────────────
+    const requestBody = {
+      phone_number: phone,
       amount: finalAmount,
-      currency: 'KES',
-      reference: transactionRef,
-      description: `Payment for ${planName} plan`
+      api_ref: transactionRef,
+      purpose: `Payment for ${planName} plan`
     };
 
-    console.log('📤 Sending STK push with params:', stkParams);
+    console.log('📤 Sending to IntaSend:', JSON.stringify(requestBody, null, 2));
+    console.log('📍 URL:', INTASEND_API_URL);
 
-    const response = await intasend.collections.mpesaStkPush(stkParams);
+    const response = await axios.post(INTASEND_API_URL, requestBody, {
+      headers: {
+        'Authorization': `Bearer ${process.env.INTASEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
 
-    console.log('📥 IntaSend STK response:', JSON.stringify(response, null, 2));
+    const intaResponse = response.data;
+    console.log('📥 IntaSend response:', JSON.stringify(intaResponse, null, 2));
 
-    // Check if the response indicates success
-    if (response.status && response.status !== 'success') {
+    // Check for errors
+    if (intaResponse.status && intaResponse.status !== 'success') {
       tx.status = 'failed';
       await tx.save();
       return res.status(400).json({
         error: 'STK push failed',
-        details: response.message || 'Unknown error'
+        details: intaResponse.message || 'Unknown error'
       });
     }
 
-    // Extract checkout ID
-    const checkoutId = response.id || response.checkout_id || null;
+    const checkoutId = intaResponse.id || intaResponse.checkout_id || null;
     if (checkoutId) {
       tx.checkoutId = checkoutId;
       await tx.save();
@@ -170,14 +162,14 @@ app.post('/api/pay', async (req, res) => {
       transactionRef,
       checkoutId,
       transactionId: tx._id,
-      rawResponse: response
+      rawResponse: intaResponse
     });
 
   } catch (error) {
     console.error('❌ STK Push error:', error.message);
-    // If the SDK throws an error with a response, log it
     if (error.response) {
-      console.error('IntaSend error details:', error.response.data);
+      console.error('Status:', error.response.status);
+      console.error('Response data:', error.response.data);
     }
     res.status(500).json({
       error: 'Failed to initiate payment',
