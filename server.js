@@ -24,7 +24,7 @@ const transactionSchema = new mongoose.Schema({
     phone: String,
     amount: String,
     status: { type: String, default: "PENDING" },
-    checkout_id: String,          // IntaSend checkout ID
+    checkout_id: String,          // IntaSend checkout ID (from initiation)
     mpesa_receipt: String,
     retryCount: { type: Number, default: 0 },
     lastRetryAt: { type: Date, default: null },
@@ -170,7 +170,7 @@ app.get("/", (req, res) => {
 });
 
 // =============================================
-// 6. Health Check Endpoint (NEW)
+// 6. Health Check Endpoint
 // =============================================
 app.get("/api/health", (req, res) => {
     res.json({ status: 'ok', service: 'intasend-server' });
@@ -180,7 +180,7 @@ app.get("/api/health", (req, res) => {
 // 7. IntaSend Configuration
 // =============================================
 const INTASEND_API_KEY = process.env.INTASEND_API_KEY;
-const INTASEND_API_URL = process.env.INTASEND_API_URL || 'https://payment.intasend.com/api/v1/collection/mpesa_stk_push/';
+const INTASEND_API_URL = process.env.INTASEND_API_URL || 'https://api.intasend.com/api/v1/payment/mpesa-stk-push/';
 
 console.log(`📍 IntaSend API URL: ${INTASEND_API_URL}`);
 
@@ -232,7 +232,8 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
             throw new Error(data.message || 'IntaSend STK push failed');
         }
 
-        const checkoutId = data.id || data.checkout_id || data.checkoutId || null;
+        // The initiation response may have 'id' or 'invoice_id' or 'checkout_id'
+        const checkoutId = data.id || data.invoice_id || data.checkout_id || data.checkoutId || null;
 
         if (!checkoutId) {
             throw new Error('No checkout ID returned from IntaSend');
@@ -414,7 +415,7 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 // =============================================
-// 13. IntaSend Webhook (Callback)
+// 13. IntaSend Webhook (Callback) – FIXED
 // =============================================
 app.post("/callback", async (req, res) => {
     console.log("========================================");
@@ -426,58 +427,82 @@ app.post("/callback", async (req, res) => {
     // Always respond with 200 to acknowledge receipt
     res.sendStatus(200);
 
-    // Process asynchronously (so we don't block IntaSend)
+    // Process asynchronously
     (async () => {
         try {
             const payload = req.body;
 
-            const checkoutId = payload.id || payload.checkout_id || payload.checkoutId;
+            // --- Extract fields from IntaSend's actual payload ---
+            const invoiceId = payload.invoice_id;
             const state = payload.state || payload.status;
-            const mpesaReceipt = payload.mpesa_receipt_number || payload.receipt || payload.transaction_receipt;
-            const transactionRef = payload.reference || payload.api_ref || payload.transactionRef;
+            const mpesaReceipt = payload.mpesa_reference || payload.mpesa_receipt_number || payload.receipt || payload.transaction_receipt;
+            const transactionRef = payload.api_ref || payload.reference || payload.transactionRef;
+            const phone = payload.account || payload.phone;
+            const amount = payload.value || payload.amount;
 
-            console.log(`📊 Status: ${state}, Checkout ID: ${checkoutId}, Receipt: ${mpesaReceipt}`);
+            console.log(`📊 Status: ${state}, Invoice ID: ${invoiceId}, Receipt: ${mpesaReceipt}`);
 
-            if (!checkoutId) {
-                console.error("❌ No checkout ID in callback payload");
-                return;
+            // --- Find the transaction ---
+            let transaction = null;
+
+            // 1. Try by invoice_id (most reliable from callback)
+            if (invoiceId) {
+                transaction = await Transaction.findOne({ checkout_id: invoiceId });
+                if (transaction) console.log(`✅ Found by invoice_id: ${invoiceId}`);
             }
 
-            let transaction = await Transaction.findOne({ checkout_id: checkoutId });
-
+            // 2. Try by api_ref (our custom reference)
             if (!transaction && transactionRef) {
                 transaction = await Transaction.findOne({ checkout_id: transactionRef });
+                if (transaction) console.log(`✅ Found by api_ref: ${transactionRef}`);
             }
 
-            if (!transaction && payload.phone && payload.amount) {
+            // 3. Fallback: phone + amount
+            if (!transaction && phone && amount) {
                 transaction = await Transaction.findOne({
-                    phone: payload.phone,
-                    amount: String(payload.amount)
+                    phone: phone,
+                    amount: String(amount)
                 }).sort({ createdAt: -1 });
+                if (transaction) console.log(`✅ Found by phone + amount: ${phone} / ${amount}`);
+            }
+
+            // 4. Broad search using any ID-like field
+            if (!transaction) {
+                const ids = [invoiceId, transactionRef, payload.id, payload.checkout_id].filter(Boolean);
+                if (ids.length > 0) {
+                    transaction = await Transaction.findOne({
+                        $or: ids.map(id => ({ checkout_id: id }))
+                    });
+                    if (transaction) console.log(`✅ Found by broad search`);
+                }
             }
 
             if (!transaction) {
-                console.error(`❌ No transaction found for checkoutId: ${checkoutId}`);
+                console.error(`❌ No transaction found for invoice_id: ${invoiceId} or api_ref: ${transactionRef}`);
                 return;
             }
 
+            // --- Determine status ---
             let status = 'FAILED';
-            if (state === 'completed' || state === 'success' || state === 'COMPLETED') {
+            if (state === 'COMPLETE' || state === 'completed' || state === 'success' || state === 'SUCCESS' || state === 'COMPLETED') {
                 status = 'SUCCESS';
             } else if (state === 'pending' || state === 'PENDING') {
                 status = 'PENDING';
             }
 
+            // --- Update transaction ---
             transaction.status = status;
             if (mpesaReceipt) {
                 transaction.mpesa_receipt = mpesaReceipt;
             }
-            if (checkoutId && transaction.checkout_id !== checkoutId) {
-                transaction.checkout_id = checkoutId;
+            // Update checkout_id if it was stored as something else (e.g., api_ref)
+            if (invoiceId && transaction.checkout_id !== invoiceId) {
+                transaction.checkout_id = invoiceId;
             }
             await transaction.save();
             console.log(`✅ Transaction ${transaction._id} updated to ${status}`);
 
+            // --- Forward on success ---
             if (status === 'SUCCESS') {
                 const callbackPayload = {
                     checkout_id: transaction.checkout_id,
@@ -505,7 +530,6 @@ app.post("/callback", async (req, res) => {
 
 // =============================================
 // 14. Alias for IntaSend webhook (backward compatibility)
-//     This forwards the request to the /callback handler
 // =============================================
 app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
     // Forward to the /callback handler
@@ -514,7 +538,7 @@ app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
 });
 
 // =============================================
-// 15. Static files (served LAST to avoid hijacking routes)
+// 15. Static files (served LAST)
 // =============================================
 app.use(express.static("docs"));
 
