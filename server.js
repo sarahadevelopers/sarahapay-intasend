@@ -24,7 +24,7 @@ const transactionSchema = new mongoose.Schema({
     phone: String,
     amount: String,
     status: { type: String, default: "PENDING" },
-    checkout_id: String,          // IntaSend checkout ID (from initiation)
+    checkout_id: String,
     mpesa_receipt: String,
     retryCount: { type: Number, default: 0 },
     lastRetryAt: { type: Date, default: null },
@@ -188,7 +188,6 @@ console.log(`📍 IntaSend API URL: ${INTASEND_API_URL}`);
 // 8. Helper: Initiate STK Push (IntaSend)
 // =============================================
 async function initiateStkPush(name, phone, amount, retryCount = 0) {
-    // Normalize phone number to 254XXXXXXXXX
     let formattedPhone = phone
         .replace(/\s+/g, '')
         .replace(/^\+/, '')
@@ -232,7 +231,6 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
             throw new Error(data.message || 'IntaSend STK push failed');
         }
 
-        // The initiation response may have 'id' or 'invoice_id' or 'checkout_id'
         const checkoutId = data.id || data.invoice_id || data.checkout_id || data.checkoutId || null;
 
         if (!checkoutId) {
@@ -415,7 +413,7 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 // =============================================
-// 13. IntaSend Webhook (Callback) – FIXED
+// 13. IntaSend Webhook (Callback) – with multi‑forward
 // =============================================
 app.post("/callback", async (req, res) => {
     console.log("========================================");
@@ -432,7 +430,6 @@ app.post("/callback", async (req, res) => {
         try {
             const payload = req.body;
 
-            // --- Extract fields from IntaSend's actual payload ---
             const invoiceId = payload.invoice_id;
             const state = payload.state || payload.status;
             const mpesaReceipt = payload.mpesa_reference || payload.mpesa_receipt_number || payload.receipt || payload.transaction_receipt;
@@ -442,22 +439,18 @@ app.post("/callback", async (req, res) => {
 
             console.log(`📊 Status: ${state}, Invoice ID: ${invoiceId}, Receipt: ${mpesaReceipt}`);
 
-            // --- Find the transaction ---
             let transaction = null;
 
-            // 1. Try by invoice_id (most reliable from callback)
             if (invoiceId) {
                 transaction = await Transaction.findOne({ checkout_id: invoiceId });
                 if (transaction) console.log(`✅ Found by invoice_id: ${invoiceId}`);
             }
 
-            // 2. Try by api_ref (our custom reference)
             if (!transaction && transactionRef) {
                 transaction = await Transaction.findOne({ checkout_id: transactionRef });
                 if (transaction) console.log(`✅ Found by api_ref: ${transactionRef}`);
             }
 
-            // 3. Fallback: phone + amount
             if (!transaction && phone && amount) {
                 transaction = await Transaction.findOne({
                     phone: phone,
@@ -466,7 +459,6 @@ app.post("/callback", async (req, res) => {
                 if (transaction) console.log(`✅ Found by phone + amount: ${phone} / ${amount}`);
             }
 
-            // 4. Broad search using any ID-like field
             if (!transaction) {
                 const ids = [invoiceId, transactionRef, payload.id, payload.checkout_id].filter(Boolean);
                 if (ids.length > 0) {
@@ -482,7 +474,6 @@ app.post("/callback", async (req, res) => {
                 return;
             }
 
-            // --- Determine status ---
             let status = 'FAILED';
             if (state === 'COMPLETE' || state === 'completed' || state === 'success' || state === 'SUCCESS' || state === 'COMPLETED') {
                 status = 'SUCCESS';
@@ -490,19 +481,16 @@ app.post("/callback", async (req, res) => {
                 status = 'PENDING';
             }
 
-            // --- Update transaction ---
             transaction.status = status;
             if (mpesaReceipt) {
                 transaction.mpesa_receipt = mpesaReceipt;
             }
-            // Update checkout_id if it was stored as something else (e.g., api_ref)
             if (invoiceId && transaction.checkout_id !== invoiceId) {
                 transaction.checkout_id = invoiceId;
             }
             await transaction.save();
             console.log(`✅ Transaction ${transaction._id} updated to ${status}`);
 
-            // --- Forward on success ---
             if (status === 'SUCCESS') {
                 const callbackPayload = {
                     checkout_id: transaction.checkout_id,
@@ -514,12 +502,19 @@ app.post("/callback", async (req, res) => {
                     reference: transactionRef || transaction._id.toString()
                 };
 
-                const RENTSPACE_WEBHOOK_URL = process.env.RENTSPACE_WEBHOOK_URL || 'https://rentspace-markeplace.onrender.com/api/subscriptions/saraha-webhook';
-                try {
-                    await axios.post(RENTSPACE_WEBHOOK_URL, callbackPayload, { timeout: 5000 });
-                    console.log(`✅ Forwarded callback to RentSpace: ${RENTSPACE_WEBHOOK_URL}`);
-                } catch (err) {
-                    console.error('❌ Failed to forward callback to RentSpace:', err.message);
+                // ─── Multi‑URL forward ──────────────────────────────
+                const webhookUrls = (process.env.RENTSPACE_WEBHOOK_URL || 'https://rentspace-markeplace.onrender.com/api/subscriptions/saraha-webhook')
+                    .split(',')
+                    .map(url => url.trim())
+                    .filter(url => url.length > 0);
+
+                for (const webhookUrl of webhookUrls) {
+                    try {
+                        await axios.post(webhookUrl, callbackPayload, { timeout: 5000 });
+                        console.log(`✅ Forwarded callback to ${webhookUrl}`);
+                    } catch (err) {
+                        console.error(`❌ Failed to forward callback to ${webhookUrl}:`, err.message);
+                    }
                 }
             }
         } catch (err) {
@@ -532,7 +527,6 @@ app.post("/callback", async (req, res) => {
 // 14. Alias for IntaSend webhook (backward compatibility)
 // =============================================
 app.post('/api/subscriptions/intasend-webhook', async (req, res) => {
-    // Forward to the /callback handler
     req.url = '/callback';
     app._router.handle(req, res);
 });
