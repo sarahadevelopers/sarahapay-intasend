@@ -509,13 +509,24 @@ app.post("/callback", async (req, res) => {
                     .filter(url => url.length > 0);
 
                 for (const webhookUrl of webhookUrls) {
-                    try {
-                        await axios.post(webhookUrl, callbackPayload, { timeout: 5000 });
-                        console.log(`✅ Forwarded callback to ${webhookUrl}`);
-                    } catch (err) {
-                        console.error(`❌ Failed to forward callback to ${webhookUrl}:`, err.message);
-                    }
-                }
+    try {
+        await axios.post(webhookUrl, callbackPayload, {
+            timeout: 5000,
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-secret': process.env.API_SECRET  // ← ADD THIS
+            }
+        });
+        console.log(`✅ Forwarded callback to ${webhookUrl}`);
+    } catch (err) {
+        console.error(`❌ Failed to forward callback to ${webhookUrl}:`, err.message);
+        // Log the response body if available for debugging
+        if (err.response) {
+            console.error(`   Response status: ${err.response.status}`);
+            console.error(`   Response data:`, err.response.data);
+        }
+    }
+}
             }
         } catch (err) {
             console.error("❌ Error processing callback:", err);
