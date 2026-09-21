@@ -9,6 +9,9 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// ✅ Trust Render's proxy so req.ip gives the real client IP
+app.set('trust proxy', 1);
+
 // =============================================
 // 1. MongoDB Connection
 // =============================================
@@ -23,6 +26,7 @@ const transactionSchema = new mongoose.Schema({
     name: String,
     phone: String,
     amount: String,
+    website: { type: String, default: 'rentspace' },  // ← WHICH CLIENT
     status: { type: String, default: "PENDING" },
     checkout_id: String,
     mpesa_receipt: String,
@@ -32,6 +36,36 @@ const transactionSchema = new mongoose.Schema({
 });
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
+
+// =============================================
+// 2b. Client Config Resolver
+// =============================================
+// Looks up per-client webhook URL + secret from env vars.
+// Convention: <UPPERCASE_WEBSITE>_WEBHOOK_URL and <UPPERCASE_WEBSITE>_CALLBACK_SECRET
+function getClientConfig(website) {
+    const key = String(website || 'rentspace').toUpperCase().replace(/[^A-Z0-9_]/g, '');
+    const url = process.env[`${key}_WEBHOOK_URL`];
+    const secret = process.env[`${key}_CALLBACK_SECRET`];
+    return { key, url, secret };
+}
+
+// Log the configured clients at boot
+function logConfiguredClients() {
+    const clients = new Set();
+    for (const k of Object.keys(process.env)) {
+        const m = k.match(/^(.+)_WEBHOOK_URL$/);
+        if (m) clients.add(m[1]);
+    }
+    if (clients.size === 0) {
+        console.warn('⚠️  No client webhooks configured. Set <CLIENT>_WEBHOOK_URL env vars.');
+    } else {
+        console.log('📋 Configured clients:');
+        clients.forEach(c => {
+            const hasSecret = Boolean(process.env[`${c}_CALLBACK_SECRET`]);
+            console.log(`   - ${c}: ${hasSecret ? '✅ secret set' : '⚠️  no secret'}`);
+        });
+    }
+}
 
 // =============================================
 // 3. Middleware – CORS + Body Parser
@@ -82,30 +116,44 @@ const checkSecret = (req, res, next) => {
     next();
 };
 
-// Global rate limit
-let globalRequestCount = 0;
-let globalWindowStart = Date.now();
-const GLOBAL_MAX = 50;
-const GLOBAL_WINDOW = 60 * 1000;
+// Per-IP rate limiter (fixed — was global before)
+const perIpCount = new Map();
+const PER_IP_MAX = 50;
+const PER_IP_WINDOW = 60 * 1000;
 
-const globalRateLimit = (req, res, next) => {
+const perIpRateLimit = (req, res, next) => {
+    const ip = req.ip || req.connection.remoteAddress;
     const now = Date.now();
-    if (now - globalWindowStart > GLOBAL_WINDOW) {
-        globalRequestCount = 0;
-        globalWindowStart = now;
+    const entry = perIpCount.get(ip) || { count: 0, windowStart: now };
+
+    if (now - entry.windowStart > PER_IP_WINDOW) {
+        entry.count = 0;
+        entry.windowStart = now;
     }
-    globalRequestCount++;
-    if (globalRequestCount > GLOBAL_MAX) {
-        return res.status(429).json({ error: "Global request limit reached. Please try again later." });
+
+    entry.count++;
+    perIpCount.set(ip, entry);
+
+    if (entry.count > PER_IP_MAX) {
+        return res.status(429).json({ error: "Rate limit reached. Please try again later." });
     }
     next();
 };
 
-// Apply middleware
+// Periodic cleanup of stale rate-limit entries
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of perIpCount.entries()) {
+        if (now - entry.windowStart > PER_IP_WINDOW * 2) {
+            perIpCount.delete(ip);
+        }
+    }
+}, 5 * 60 * 1000);
+
 app.use('/api/pay', checkSecret);
 app.use('/api/retry-payment', checkSecret);
-app.use('/api/pay', globalRateLimit);
-app.use('/api/retry-payment', globalRateLimit);
+app.use('/api/pay', perIpRateLimit);
+app.use('/api/retry-payment', perIpRateLimit);
 
 // IP blocking
 const violationStore = new Map();
@@ -163,14 +211,14 @@ app.use('/api/pay', checkBlocked, paymentLimiter);
 app.use('/api/retry-payment', checkBlocked, paymentLimiter);
 
 // =============================================
-// 5. Root Route (API info)
+// 5. Root Route
 // =============================================
 app.get("/", (req, res) => {
     res.send("sarahapay API Running – IntaSend Express");
 });
 
 // =============================================
-// 6. Health Check Endpoint
+// 6. Health Check
 // =============================================
 app.get("/api/health", (req, res) => {
     res.json({ status: 'ok', service: 'intasend-server' });
@@ -183,11 +231,12 @@ const INTASEND_API_KEY = process.env.INTASEND_API_KEY;
 const INTASEND_API_URL = process.env.INTASEND_API_URL || 'https://api.intasend.com/api/v1/payment/mpesa-stk-push/';
 
 console.log(`📍 IntaSend API URL: ${INTASEND_API_URL}`);
+logConfiguredClients();
 
 // =============================================
-// 8. Helper: Initiate STK Push (IntaSend)
+// 8. Helper: Initiate STK Push
 // =============================================
-async function initiateStkPush(name, phone, amount, retryCount = 0) {
+async function initiateStkPush(name, phone, amount, retryCount = 0, website = 'rentspace') {
     let formattedPhone = phone
         .replace(/\s+/g, '')
         .replace(/^\+/, '')
@@ -211,7 +260,8 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
     console.log("📤 IntaSend STK Request:", {
         phone: payload.phone_number,
         amount: payload.amount,
-        api_ref: payload.api_ref
+        api_ref: payload.api_ref,
+        website
     });
 
     try {
@@ -242,6 +292,7 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
             phone: formattedPhone,
             amount: parseFloat(amount).toFixed(2),
             checkout_id: checkoutId,
+            website: website,       // ← PERSIST CLIENT IDENTITY
             retryCount: retryCount,
             lastRetryAt: new Date()
         });
@@ -263,9 +314,16 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
 // =============================================
 app.post("/api/pay", async (req, res) => {
     try {
-        const { name, phone, amount } = req.body;
+        const { name, phone, amount, website = 'rentspace' } = req.body;
         if (!name || !phone || !amount) {
             return res.status(400).json({ error: "Name, phone and amount required" });
+        }
+
+        // Validate website has a configured webhook
+        const clientConfig = getClientConfig(website);
+        if (!clientConfig.url) {
+            console.warn(`❌ Unknown website: "${website}" (no ${clientConfig.key}_WEBHOOK_URL)`);
+            return res.status(400).json({ error: `Unknown website: ${website}` });
         }
 
         let formattedPhone = phone
@@ -306,7 +364,7 @@ app.post("/api/pay", async (req, res) => {
             }
         }
 
-        const tx = await initiateStkPush(name, formattedPhone, amount, lastTx?.retryCount || 0);
+        const tx = await initiateStkPush(name, formattedPhone, amount, lastTx?.retryCount || 0, website);
         res.status(201).json({
             message: "STK Push Sent",
             transactionId: tx._id
@@ -363,11 +421,13 @@ app.post("/api/retry-payment", async (req, res) => {
             { status: "FAILED", lastRetryAt: new Date() }
         );
 
+        // Preserve the original website on retry
         const newTx = await initiateStkPush(
             lastTx.name,
             formattedPhone,
             lastTx.amount,
-            retryCount + 1
+            retryCount + 1,
+            lastTx.website || 'rentspace'
         );
 
         res.status(201).json({
@@ -398,7 +458,7 @@ app.get("/api/transactions", async (req, res) => {
 });
 
 // =============================================
-// 12. Get Single Transaction by ID
+// 12. Get Single Transaction
 // =============================================
 app.get("/api/transaction/:id", async (req, res) => {
     try {
@@ -413,12 +473,11 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 // =============================================
-// 13. IntaSend Webhook (Callback) – with multi‑forward
+// 13. IntaSend Webhook (Callback) – multi-tenant forward
 // =============================================
 app.post("/callback", async (req, res) => {
     console.log("========================================");
     console.log("🔔 INTASEND CALLBACK RECEIVED");
-    console.log("📌 Headers:", req.headers);
     console.log("📌 Body:", req.body);
     console.log("========================================");
 
@@ -474,10 +533,11 @@ app.post("/callback", async (req, res) => {
                 return;
             }
 
-            let status = 'FAILED';
-            if (state === 'COMPLETE' || state === 'completed' || state === 'success' || state === 'SUCCESS' || state === 'COMPLETED') {
+                        let status = 'FAILED';
+            const stateLower = String(state || '').toLowerCase();
+            if (stateLower === 'complete' || stateLower === 'completed' || stateLower === 'success') {
                 status = 'SUCCESS';
-            } else if (state === 'pending' || state === 'PENDING') {
+            } else if (stateLower === 'pending') {
                 status = 'PENDING';
             }
 
@@ -489,44 +549,50 @@ app.post("/callback", async (req, res) => {
                 transaction.checkout_id = invoiceId;
             }
             await transaction.save();
-            console.log(`✅ Transaction ${transaction._id} updated to ${status}`);
+            console.log(`✅ Transaction ${transaction._id} updated to ${status} (website: ${transaction.website})`);
 
-            if (status === 'SUCCESS') {
-                const callbackPayload = {
-                    checkout_id: transaction.checkout_id,
-                    status: 'paid',
-                    mpesa_receipt: mpesaReceipt || transaction.mpesa_receipt,
-                    amount: transaction.amount,
-                    phone: transaction.phone,
-                    name: transaction.name,
-                    reference: transactionRef || transaction._id.toString()
-                };
+            if (status !== 'SUCCESS') return;
 
-                // ─── Multi‑URL forward ──────────────────────────────
-                const webhookUrls = (process.env.RENTSPACE_WEBHOOK_URL || 'https://rentspace-markeplace.onrender.com/api/subscriptions/saraha-webhook')
-                    .split(',')
-                    .map(url => url.trim())
-                    .filter(url => url.length > 0);
+            // ─── Multi-tenant forward ──────────────────────────
+            const website = transaction.website || 'rentspace';
+            const clientConfig = getClientConfig(website);
 
-                for (const webhookUrl of webhookUrls) {
-    try {
-        await axios.post(webhookUrl, callbackPayload, {
-            timeout: 5000,
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-secret': process.env.API_SECRET  // ← ADD THIS
+            if (!clientConfig.url) {
+                console.error(`❌ No webhook URL configured for website "${website}" (checked ${clientConfig.key}_WEBHOOK_URL)`);
+                return;
             }
-        });
-        console.log(`✅ Forwarded callback to ${webhookUrl}`);
-    } catch (err) {
-        console.error(`❌ Failed to forward callback to ${webhookUrl}:`, err.message);
-        // Log the response body if available for debugging
-        if (err.response) {
-            console.error(`   Response status: ${err.response.status}`);
-            console.error(`   Response data:`, err.response.data);
-        }
-    }
-}
+
+            if (!clientConfig.secret) {
+                console.warn(`⚠️  No callback secret for website "${website}" — sending without x-callback-secret header.`);
+            }
+
+            const callbackPayload = {
+                checkout_id: transaction.checkout_id,
+                status: 'paid',
+                mpesa_receipt: mpesaReceipt || transaction.mpesa_receipt,
+                amount: transaction.amount,
+                phone: transaction.phone,
+                name: transaction.name,
+                reference: transactionRef || transaction._id.toString()
+            };
+
+            const headers = { 'Content-Type': 'application/json' };
+            if (clientConfig.secret) {
+                headers['x-callback-secret'] = clientConfig.secret;
+            }
+
+            try {
+                await axios.post(clientConfig.url, callbackPayload, {
+                    timeout: 5000,
+                    headers
+                });
+                console.log(`✅ Forwarded callback to ${website} → ${clientConfig.url}`);
+            } catch (err) {
+                console.error(`❌ Failed to forward callback to ${website} (${clientConfig.url}):`, err.message);
+                if (err.response) {
+                    console.error(`   Response status: ${err.response.status}`);
+                    console.error(`   Response data:`, err.response.data);
+                }
             }
         } catch (err) {
             console.error("❌ Error processing callback:", err);
